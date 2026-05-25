@@ -80,7 +80,7 @@ shell wrapper) so the postmaster inherits them.
 
 ## Architecture notes
 
-### Per-backend SDK, not per-postmaster
+### Per-backend SDK, not per-postmaster (and why this is suboptimal)
 
 postgres `fork()`s a backend for each connection.  `BatchSpanProcessor`
 spawns a worker thread — and threads don't survive fork.  If we built the
@@ -88,11 +88,57 @@ processor in `_PG_init` (which runs once in the postmaster), every backend
 would inherit only the *sender* half of a channel whose receiver thread
 was lost at fork; spans would silently vanish.
 
-Mitigation: `_PG_init` only registers the emit hook.  The SDK
-(BatchSpanProcessor, exporter, runtime, resource) is constructed lazily
-in each backend the first time it emits a span.  Cost: one worker thread
-+ one exporter connection per active backend.  This matches the postgres
-process model.
+What this demo does: `_PG_init` only registers the emit hook.  The SDK
+(BatchSpanProcessor, exporter, tokio runtime, resource) is constructed
+lazily in each backend the first time it emits a span.
+
+**This is fine for a demo but not the architecture you actually want.**
+The opentelemetry-rust SDK is designed around long-lived in-process
+state: one provider, one batch processor, one exporter connection,
+threads shared across the whole workload.  We are using it
+backwards — every backend pays for its own:
+
+* tokio current-thread runtime (one OS thread per active backend)
+* BatchSpanProcessor worker + bounded channel
+* exporter state (for OTLP: its own gRPC connection, TLS handshake,
+  HTTP/2 stream multiplex)
+* Resource detection (env-var parsing, default-detector logic)
+
+At idle these costs are noise; under load (hundreds of concurrent
+backends, especially with frequent connect/disconnect) they add up:
+RAM per backend creeps, every short-lived backend pays the OTLP
+TLS handshake on its way to also dropping its last in-flight batch,
+the collector sees N tiny streams instead of one fat one, and
+batching becomes per-backend rather than across the cluster.
+
+**The fix for production use** is the standard postgres pattern: a
+single background worker owns the SDK, and backends hand spans off
+to it via shared memory.  The bgworker is started by the postmaster
+before any backend forks, so it can hold long-lived OTel SDK state,
+hold one OTLP connection, and batch across the whole cluster.
+
+Two reasonable shm queues:
+
+* `shm_mq` (postgres-native ring buffer, single-producer-single-consumer
+  — would need one queue per backend, all polled by the bgworker).
+  Simple but the bgworker's wake/poll loop gets gnarly at high backend
+  counts.
+* A lock-free MPSC ring (e.g. an `Arc<crossbeam::queue::ArrayQueue>`
+  over a postgres shared-memory segment, or a hand-rolled ring with
+  atomics).  One queue for the whole cluster, backends are pure
+  producers, the bgworker is the only consumer.  Much friendlier
+  scaling characteristics, more code to get right.
+
+Span serialization across the boundary needs a stable wire format
+since the bgworker can't deref backend-owned `palloc` pointers — the
+easiest is to encode each span as a pre-serialized OTLP-Span protobuf
+in the backend (skipping the SDK's full processor) and just hand the
+opaque byte buffer to the bgworker, which then drains a batch into
+the SDK's exporter.
+
+This demo intentionally skips all that for simplicity; expect a
+follow-on (`postgres_otel_tracing` proper, dropping the `_demo`
+suffix) to do it right.
 
 ### Force-set `TraceFlags::SAMPLED`
 
