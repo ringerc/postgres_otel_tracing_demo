@@ -4,6 +4,8 @@ A demo PostgreSQL extension that consumes spans from `contrib/otel` and ships
 them through the **real `opentelemetry-rust` SDK** — to stdout (default) or to
 an OTLP collector via gRPC.
 
+Requires [patched postgres + `contrib/otel`](https://github.com/ringerc/postgres/pull/1)
+
 Status: proof-of-concept, smoke-tested against postgres 19devel.
 
 ## What it demonstrates
