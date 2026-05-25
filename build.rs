@@ -41,10 +41,20 @@ fn main() {
         .clang_arg(format!("-I{}", server_inc))
         .clang_arg(format!("-I{}/extension", server_inc))
         .clang_arg("-D_GNU_SOURCE")
-        // Only emit Rust for the otel api surface + the one postgres
-        // helper we call directly.  Everything else stays out.
+        // Only emit Rust for the otel api surface, the postgres
+        // helpers we call directly, and the magic-block plumbing
+        // we use to expose Pg_magic_func from pure Rust (no C shim;
+        // the pgrx-style approach).  Everything else stays out.
         .allowlist_type("Otel.*")
         .allowlist_var("OTEL_.*")
+        .allowlist_type("Pg_magic_struct")
+        .allowlist_type("Pg_abi_values")
+        .allowlist_var("PG_VERSION_NUM")
+        .allowlist_var("FUNC_MAX_ARGS")
+        .allowlist_var("INDEX_MAX_KEYS")
+        .allowlist_var("NAMEDATALEN")
+        .allowlist_var("FLOAT8PASSBYVAL")
+        .allowlist_var("FMGR_ABI_EXTRA")
         .allowlist_function("find_rendezvous_variable")
         // Make the generated structs Copy/Clone-friendly for our
         // FFI translation glue.  (Default = true for POD types
@@ -62,31 +72,10 @@ fn main() {
         .write_to_file(out_path.join("bindings.rs"))
         .expect("could not write bindings.rs");
 
-    // Compile the C shim that emits PG_MODULE_MAGIC.  Postgres' dlopen
-    // path looks for Pg_magic_func() with a struct that pins the abi
-    // version it was built for; this is easier to produce via the
-    // canonical PG_MODULE_MAGIC macro from a tiny C file than to
-    // reproduce its struct layout + version-derived contents in Rust.
-    cc::Build::new()
-        .file("c_shim/magic.c")
-        .include(&server_inc)
-        // Force default visibility on the shim so Pg_magic_func ends
-        // up in the cdylib's dynsym table.  Postgres only consults
-        // the dynamic symbol table when verifying ABI; a hidden
-        // symbol would render this module "not a postgres extension"
-        // at dlopen time.
-        .flag_if_supported("-fPIC")
-        .flag_if_supported("-fvisibility=default")
-        .flag_if_supported("-Wno-deprecated-declarations")
-        .compile("pg_module_magic");
-    println!("cargo:rerun-if-changed=c_shim/magic.c");
-
     // Postgres-loadable-module convention: undefined references in
     // the cdylib are resolved by postgres at dlopen() time.  Linux's
-    // `-shared` already tolerates undefined symbols by default (and
-    // any --unresolved-symbols=ignore-all here would suppress the
-    // very reference that pulls Pg_magic_func out of the static
-    // archive).  macOS needs an explicit flag.
+    // `-shared` already tolerates undefined symbols by default; macOS
+    // needs an explicit flag.
     if cfg!(target_os = "macos") {
         println!("cargo:rustc-cdylib-link-arg=-Wl,-undefined,dynamic_lookup");
     }

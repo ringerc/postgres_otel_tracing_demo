@@ -49,35 +49,66 @@ use std::os::raw::{c_char, c_int};
 use std::panic::catch_unwind;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-// ---- PG_MODULE_MAGIC re-export -----------------------------------
+// ---- PG_MODULE_MAGIC, pure Rust ----------------------------------
 //
-// The actual Pg_magic_func is defined in c_shim/magic.c (the
-// PG_MODULE_MAGIC macro expansion depends on postgres.h macros that
-// we don't want to reproduce in Rust).  Two things have to happen:
+// Postgres' dlopen path calls dlsym("Pg_magic_func") on the module
+// and expects a Pg_magic_struct describing the ABI version it was
+// built against.  The canonical way to produce this is the
+// PG_MODULE_MAGIC macro in C; pgrx reproduces it in pure Rust by
+// reading the postgres constants from bindgen and emitting the
+// struct as a Rust static.  Same trick here.
 //
-//   1. The symbol must be pulled from the static archive into the
-//      cdylib.  Rust's cdylib link applies a version script that
-//      restricts the dynamic symbol table to `#[no_mangle]` items;
-//      any other archive-resident symbol gets downgraded to LOCAL
-//      and thus hidden from dlsym().
+// The struct fields and their sources (all from
+// `$(pg_config --includedir-server)`, allowlisted in build.rs):
 //
-//   2. Postgres' dlopen-time ABI check calls dlsym("Pg_magic_func")
-//      on the loaded module --- so the symbol MUST appear in the
-//      dynamic symbol table by exactly that name.
+//   version       PG_VERSION_NUM / 100
+//   funcmaxargs   FUNC_MAX_ARGS         (pg_config_manual.h)
+//   indexmaxkeys  INDEX_MAX_KEYS        (pg_config_manual.h)
+//   namedatalen   NAMEDATALEN           (pg_config_manual.h)
+//   float8byval   FLOAT8PASSBYVAL       (c.h)
+//   abi_extra     FMGR_ABI_EXTRA        (pg_config_manual.h)
 //
-// Solution: c_shim/magic.c defines `pg_magic_data_get()` (which
-// contains the PG_MODULE_MAGIC_DATA struct literal), and Rust
-// re-exports it under the postgres-expected name `Pg_magic_func`
-// via a #[no_mangle] trampoline.  The trampoline name appears in
-// the dynamic symbol table by virtue of #[no_mangle] + cdylib's
-// version script; its body forwards to the C-side implementation.
-unsafe extern "C" {
-    fn pg_magic_data_get() -> *const std::ffi::c_void;
+// The const-fn dance below is just for filling the fixed-size
+// abi_extra char array at compile time --- FMGR_ABI_EXTRA is a
+// NUL-terminated string literal and abi_extra is [c_char; 32].
+
+const fn abi_extra_array() -> [c_char; 32] {
+    let mut arr = [0 as c_char; 32];
+    let src: &[u8] = FMGR_ABI_EXTRA;
+    let mut i = 0;
+    while i < src.len() && i < arr.len() {
+        arr[i] = src[i] as c_char;
+        i += 1;
+    }
+    arr
 }
 
+// Pg_magic_struct contains *const c_char fields (name, version) and
+// thus isn't Send/Sync.  But we only ever read it, never write, and
+// the values we put in are null pointers or pointers into rodata.
+// Wrap in a #[repr(transparent)] newtype with an unsafe Sync impl,
+// the same pattern pgrx uses (their AssertSync<Pg_magic_struct>).
+#[repr(transparent)]
+struct AssertSync<T>(T);
+unsafe impl<T> Sync for AssertSync<T> {}
+
+static PG_MAGIC_DATA: AssertSync<Pg_magic_struct> = AssertSync(Pg_magic_struct {
+    len: std::mem::size_of::<Pg_magic_struct>() as c_int,
+    abi_fields: Pg_abi_values {
+        version: (PG_VERSION_NUM / 100) as c_int,
+        funcmaxargs: FUNC_MAX_ARGS as c_int,
+        indexmaxkeys: INDEX_MAX_KEYS as c_int,
+        namedatalen: NAMEDATALEN as c_int,
+        float8byval: FLOAT8PASSBYVAL as c_int,
+        abi_extra: abi_extra_array(),
+    },
+    name: std::ptr::null(),
+    version: std::ptr::null(),
+});
+
 #[no_mangle]
-pub unsafe extern "C" fn Pg_magic_func() -> *const std::ffi::c_void {
-    pg_magic_data_get()
+pub extern "C" fn Pg_magic_func() -> *const Pg_magic_struct {
+    &PG_MAGIC_DATA.0
 }
 
 // ---- FFI conveniences --------------------------------------------

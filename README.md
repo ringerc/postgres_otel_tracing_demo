@@ -205,17 +205,38 @@ harness (`cargo pgrx test`), `pgrx` is the right call: every one of
 those is much easier through `pgrx` than by hand.  This demo is the
 "prove the API works" step; that one is "make it production-shaped."
 
-### `Pg_magic_func` exported via a C shim + Rust trampoline
+### `Pg_magic_func` in pure Rust (pgrx-style, no C shim)
 
 PostgreSQL requires every loadable module to expose a `Pg_magic_func`
-that returns a versioned ABI struct.  Reproducing the struct contents
-from Rust would mean re-implementing `pg_config.h` macros; we cheat by
-compiling a tiny `c_shim/magic.c` that uses the canonical
-`PG_MODULE_MAGIC` macro under a renamed function name, then re-exporting
-that under the postgres-expected name via a `#[no_mangle]` Rust
-trampoline.  Rust's cdylib link applies a version script that demotes
-archive-pulled symbols to LOCAL; the trampoline is what gets the
-postgres-visible name into the dynamic symbol table.
+that returns a versioned `Pg_magic_struct` describing the ABI it was
+built against.  The canonical way to produce one is the
+`PG_MODULE_MAGIC` macro in C.
+
+We build it in pure Rust instead, the same way pgrx does: bindgen
+extracts the constants we need from the postgres headers
+(`PG_VERSION_NUM`, `FUNC_MAX_ARGS`, `INDEX_MAX_KEYS`, `NAMEDATALEN`,
+`FLOAT8PASSBYVAL`, `FMGR_ABI_EXTRA`) as Rust `pub const`s, then
+[src/lib.rs](src/lib.rs) emits a `Pg_magic_struct` static with those
+values and exposes it via `#[no_mangle] pub extern "C" fn
+Pg_magic_func`.
+
+This sidesteps two problems the C-shim approach had:
+
+* The shim had to be linked into the cdylib, but Rust's cdylib link
+  applies a version script that demotes archive-pulled symbols to
+  LOCAL.  We'd had to use a `#[no_mangle]` Rust trampoline to drag
+  the name into the dynamic symbol table.  With pure-Rust, the
+  `Pg_magic_func` definition IS the `#[no_mangle]` item and lands
+  in dynsym directly.
+* No `cc` build-dep, no C toolchain required at extension-build
+  time.  bindgen still calls libclang under the hood, but the build
+  is otherwise pure-cargo.
+
+`Pg_magic_struct` contains `*const c_char` fields (the optional
+`name` / `version`) so a plain `static` would fail to be `Sync`.
+Wrapping in a `#[repr(transparent)] struct AssertSync<T>(T)` with
+an `unsafe impl<T> Sync for AssertSync<T>` is the standard pgrx
+move and is sound because we only ever read the static.
 
 ### Shutdown via `on_proc_exit`
 
