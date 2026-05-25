@@ -175,6 +175,36 @@ fix is local to the SDK-side `SpanContext` we construct: force
 not touched (and is anyway not propagated anywhere by this demo);
 all we're doing is telling the SDK "yes, export this."
 
+### Why no `pgrx`?
+
+[`pgrx`](https://github.com/pgcentralfoundation/pgrx) is the de-facto
+framework for postgres extensions in Rust.  It would resolve some of
+the friction this demo hits manually --- `pg_module_magic!()` replaces
+the magic-func dance below, `BackgroundWorker` registration is
+first-class, and `shm_mq` plumbing is wrapped in safe Rust types.
+
+For this demo we deliberately stay on a bare `cdylib` for two
+reasons:
+
+1. **Story clarity.**  The point of contrib/otel's rendezvous API is
+   that any out-of-tree Rust module can plug in; adding `pgrx` to the
+   recipe would suggest it's a required ingredient.  The "minimum to
+   consume contrib/otel" answer should be `opentelemetry-rust` + ~500
+   lines + bindgen, not "and pull in pgrx + pg_sys."
+2. **Dependency surface.**  `pgrx` brings the full `pg_sys` generated
+   bindings (most of postgres' header tree), the `cargo-pgrx` CLI,
+   and a release cadence pinned to specific postgres majors.  We
+   need none of postgres' SQL-side machinery in a pure preload hook.
+
+The **production** version --- the one with a postmaster-started
+bgworker that owns the SDK and drains spans from a shared-memory
+queue (see "Per-backend SDK" above) --- is a different conversation.
+By the time we want `BackgroundWorker` registration, shared-memory
+segment hooks, postgres GUCs for runtime config, and a real test
+harness (`cargo pgrx test`), `pgrx` is the right call: every one of
+those is much easier through `pgrx` than by hand.  This demo is the
+"prove the API works" step; that one is "make it production-shaped."
+
 ### `Pg_magic_func` exported via a C shim + Rust trampoline
 
 PostgreSQL requires every loadable module to expose a `Pg_magic_func`
