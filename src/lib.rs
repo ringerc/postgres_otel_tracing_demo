@@ -33,14 +33,16 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 use once_cell::sync::OnceCell;
 use opentelemetry::{
-    trace::{SpanContext, SpanId, SpanKind, Status, TraceFlags, TraceId, TraceState},
+    trace::{
+        SamplingDecision, SpanContext, SpanId, SpanKind, Status, TraceFlags, TraceId, TraceState,
+    },
     InstrumentationScope, Key, KeyValue,
 };
 use opentelemetry_sdk::{
     export::trace::SpanData,
     resource::{EnvResourceDetector, ResourceDetector, TelemetryResourceDetector},
     runtime::TokioCurrentThread,
-    trace::{BatchSpanProcessor, SpanEvents, SpanLinks, SpanProcessor},
+    trace::{BatchSpanProcessor, Sampler, ShouldSample, SpanEvents, SpanLinks, SpanProcessor},
     Resource,
 };
 use std::borrow::Cow;
@@ -143,10 +145,24 @@ struct BackendState {
 
 /// Prev-hook for chaining.  Set once in _PG_init (postmaster).
 static PREV_EMIT: OnceCell<otel_span_emit_hook_type> = OnceCell::new();
+static PREV_SAMPLER: OnceCell<otel_sampler_hook_type> = OnceCell::new();
 
 /// Cached exporter-kind decision (env-var look-up done once in
 /// _PG_init; backends just consult the result).
 static EXPORTER_KIND: OnceCell<ExporterKind> = OnceCell::new();
+
+/// Sampler built from OTEL_TRACES_SAMPLER + OTEL_TRACES_SAMPLER_ARG
+/// at _PG_init time.  Consulted by sampler_hook (which itself is
+/// only called by contrib/otel on the propagated-bit-unset path ---
+/// see gate 5 in contrib/otel's decide_whether_to_record).  The
+/// Sampler is `Send + Sync + Clone` for every variant we accept
+/// (AlwaysOn, AlwaysOff, TraceIdRatioBased --- the Jaeger remote
+/// variant is gated off by feature flag).
+///
+/// None means "no sampler configured" → fall back to contrib/otel's
+/// own default (DROP on unset-bit, the OTel-SDK ParentBased
+/// behaviour).
+static SAMPLER: OnceCell<Sampler> = OnceCell::new();
 
 #[derive(Copy, Clone)]
 enum ExporterKind {
@@ -207,14 +223,68 @@ unsafe fn init_inner() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Register the emit hook.  All SDK construction is deferred to
     //    the backend (see emit_hook + ensure_backend) because threads
     //    don't survive fork().
-    let mut prev_out: otel_span_emit_hook_type = None;
-    let register = api
+    let mut prev_emit_out: otel_span_emit_hook_type = None;
+    let register_emit = api
         .register_emit_hook
         .ok_or("OtelTracingApi.register_emit_hook is null")?;
-    register(Some(emit_hook), &mut prev_out);
-    PREV_EMIT.set(prev_out).ok();
+    register_emit(Some(emit_hook), &mut prev_emit_out);
+    PREV_EMIT.set(prev_emit_out).ok();
+
+    // 4. Build the Sampler from OTEL_TRACES_SAMPLER + OTEL_TRACES_SAMPLER_ARG.
+    //    Register the sampler hook only if we built one --- if env asked
+    //    for an unrecognized sampler we leave the slot empty and contrib/
+    //    otel falls back to its OTel-SDK ParentBased default (drop on
+    //    unset bit).
+    if let Some(sampler) = build_sampler_from_env() {
+        SAMPLER.set(sampler).ok();
+        let mut prev_sampler_out: otel_sampler_hook_type = None;
+        let register_sampler = api
+            .register_sampler_hook
+            .ok_or("OtelTracingApi.register_sampler_hook is null")?;
+        register_sampler(Some(sampler_hook), &mut prev_sampler_out);
+        PREV_SAMPLER.set(prev_sampler_out).ok();
+    }
 
     Ok(())
+}
+
+/// Build an SDK Sampler from the OTEL_TRACES_SAMPLER env var, honouring
+/// OTEL_TRACES_SAMPLER_ARG for the ratio variants.  Returns None for
+/// unrecognized sampler names (caller treats this as "no sampler
+/// registered").
+///
+/// Scope: contrib/otel calls our sampler hook ONLY when the propagated
+/// W3C sampled bit is unset (see gate 5 in contrib/otel's
+/// decide_whether_to_record).  Upstream sampled=1 always wins for W3C
+/// compliance, and otel.trace_all_queries=on overrides at an earlier
+/// gate.  The `parentbased_*` prefix is therefore informational here:
+/// contrib/otel already handles parent-based logic in C, so we strip
+/// the prefix and just use the delegate sampler.
+fn build_sampler_from_env() -> Option<Sampler> {
+    let name = std::env::var("OTEL_TRACES_SAMPLER")
+        .unwrap_or_else(|_| "parentbased_always_on".into())
+        .to_lowercase();
+    let arg = std::env::var("OTEL_TRACES_SAMPLER_ARG").ok();
+
+    match name.as_str() {
+        "always_on" | "parentbased_always_on" => Some(Sampler::AlwaysOn),
+        "always_off" | "parentbased_always_off" => Some(Sampler::AlwaysOff),
+        "traceidratio" | "parentbased_traceidratio" => {
+            let ratio: f64 = arg
+                .and_then(|s| s.parse::<f64>().ok())
+                .map(|r| r.clamp(0.0, 1.0))
+                .unwrap_or(1.0);
+            Some(Sampler::TraceIdRatioBased(ratio))
+        }
+        "jaeger_remote" | "parentbased_jaeger_remote" => {
+            eprintln!("postgres_otel_tracing_demo: OTEL_TRACES_SAMPLER={name} not supported in this demo");
+            None
+        }
+        other => {
+            eprintln!("postgres_otel_tracing_demo: OTEL_TRACES_SAMPLER={other} unrecognized; falling back to contrib/otel default");
+            None
+        }
+    }
 }
 
 /// Lazily build the backend-local SDK state on first emit in this
@@ -288,6 +358,71 @@ fn build_backend_state(kind: ExporterKind) -> Result<BackendState, Box<dyn std::
 }
 
 // ---- Span emit hook ----------------------------------------------
+
+/// Sampler hook --- contrib/otel calls this when the propagated W3C
+/// sampled bit is UNSET (gate 5 of its decide_whether_to_record).
+/// We delegate to the OTel SDK Sampler we built from env vars.
+///
+/// Lives entirely in postmaster-static state (`SAMPLER`); no fork-
+/// sensitive resources to lazy-init, no threads.  This means the
+/// hook is cheap (no allocation in the steady state) which matches
+/// contrib/otel's "MUST be fast (~nanoseconds), MUST NOT allocate
+/// if avoidable" contract.
+unsafe extern "C" fn sampler_hook(input: *const OtelSamplerInput) -> OtelSamplerDecision {
+    let result = catch_unwind(|| -> OtelSamplerDecision {
+        if input.is_null() {
+            return OtelSamplerDecision_OTEL_SAMPLE_DROP;
+        }
+        let input = &*input;
+
+        let sampler = match SAMPLER.get() {
+            Some(s) => s,
+            None => return OtelSamplerDecision_OTEL_SAMPLE_DROP,
+        };
+
+        // OtelSamplerInput.trace_id is a *const c_char into a NUL-
+        // terminated 32-hex buffer owned by contrib/otel.  Parse to
+        // TraceId for the SDK call.
+        let trace_id = if input.trace_id.is_null() {
+            TraceId::INVALID
+        } else {
+            TraceId::from_hex(&CStr::from_ptr(input.trace_id).to_string_lossy())
+                .unwrap_or(TraceId::INVALID)
+        };
+
+        let name = c_str_or_empty(input.name);
+        let kind = map_kind(input.kind);
+
+        // Call the SDK's should_sample.  We pass parent_context=None
+        // because contrib/otel has already applied parent-based logic
+        // before invoking this hook (the W3C bit was checked at gate
+        // 4).  The `parentbased_*` prefix in OTEL_TRACES_SAMPLER is
+        // therefore informational; we strip it in build_sampler_from_env
+        // and use the delegate directly.
+        let result = sampler.should_sample(
+            None, /* parent_context */
+            trace_id,
+            &name,
+            &kind,
+            &[],  /* attributes */
+            &[],  /* links */
+        );
+
+        match result.decision {
+            SamplingDecision::Drop => OtelSamplerDecision_OTEL_SAMPLE_DROP,
+            SamplingDecision::RecordOnly => OtelSamplerDecision_OTEL_SAMPLE_RECORD_ONLY,
+            SamplingDecision::RecordAndSample => OtelSamplerDecision_OTEL_SAMPLE_RECORD_AND_SAMPLE,
+        }
+    });
+
+    // We deliberately do NOT chain to PREV_SAMPLER.  Unlike the emit
+    // hook (where every consumer wants to see every span), the
+    // sampler hook produces a single decision; "stacked samplers"
+    // have no obvious composition rule.  The contract is: the
+    // last-registered sampler wins; previously-registered hooks are
+    // shadowed.  Document this in the README.
+    result.unwrap_or(OtelSamplerDecision_OTEL_SAMPLE_DROP)
+}
 
 unsafe extern "C" fn emit_hook(span_ptr: *const OtelSpan) {
     let _ = catch_unwind(|| {
