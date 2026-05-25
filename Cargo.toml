@@ -1,0 +1,42 @@
+[package]
+name = "postgres_otel_tracing_demo"
+version = "0.1.0"
+edition = "2021"
+license = "PostgreSQL"
+description = "Demo OpenTelemetry exporter for PostgreSQL contrib/otel via the OtelTracingApi rendezvous variable"
+repository = "https://github.com/ringerc/postgres_otel_tracing_demo"
+
+[lib]
+# cdylib because we're producing a postgres loadable module (.so / .dylib /
+# .dll) that postgres dlopens at startup.  Not a library other Rust code
+# links against.
+crate-type = ["cdylib"]
+
+[dependencies]
+# OpenTelemetry SDK + a couple of exporters.  Versions are pinned to a
+# single minor; the OTel-rust ecosystem still occasionally reshuffles
+# types across minors so we don't want cargo silently upgrading.
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["trace", "rt-tokio-current-thread"] }
+opentelemetry-stdout = { version = "0.27", features = ["trace"] }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "trace"] }
+
+# Async runtime used by BatchSpanProcessor.  current_thread flavor only
+# (single-threaded executor) to avoid spawning worker pools inside a
+# postgres backend; see the design notes in README for rationale.
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
+
+# Lazy global initialization.
+once_cell = "1"
+
+[build-dependencies]
+bindgen = "0.71"
+cc = "1"
+
+[profile.release]
+# Keep symbols readable so backtraces from the SDK or our FFI shim
+# don't render as ?? in a postgres log.
+strip = "none"
+# LTO trims a noticeable amount off the .so but doubles link time;
+# disable it for the demo to keep the dev loop fast.
+lto = false
