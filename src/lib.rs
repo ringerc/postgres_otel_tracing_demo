@@ -245,7 +245,41 @@ unsafe fn init_inner() -> Result<(), Box<dyn std::error::Error>> {
         PREV_SAMPLER.set(prev_sampler_out).ok();
     }
 
+    // 5. Optionally override contrib/otel's sampler-hook invocation
+    //    policy.  Recognized values for POSTGRES_OTEL_SAMPLER_HOOK_POLICY
+    //    (the env-var name is non-standard --- the policy is a
+    //    contrib/otel concept that doesn't map to anything in the
+    //    OpenTelemetry spec, so we use a deliberately
+    //    project-prefixed name):
+    //
+    //      hook_on_unsampled_bit  - default (W3C-compliant)
+    //      hook_always            - SDK sees every span, even bit=1
+    //      never_respect_bit      - pure wire-bit, hook never called
+    //      never_always_sample    - record everything (hook ignored)
+    if let Some(policy) = parse_sampler_policy_env() {
+        if let Some(set_policy) = api.set_sampler_policy {
+            set_policy(policy);
+        }
+    }
+
     Ok(())
+}
+
+fn parse_sampler_policy_env() -> Option<OtelSamplerHookPolicy> {
+    let raw = std::env::var("POSTGRES_OTEL_SAMPLER_HOOK_POLICY").ok()?;
+    match raw.to_lowercase().as_str() {
+        "hook_on_unsampled_bit" => Some(OtelSamplerHookPolicy_OTEL_SAMPLER_HOOK_ON_UNSAMPLED_BIT),
+        "hook_always" => Some(OtelSamplerHookPolicy_OTEL_SAMPLER_HOOK_ALWAYS),
+        "never_respect_bit" => Some(OtelSamplerHookPolicy_OTEL_SAMPLER_HOOK_NEVER_RESPECT_BIT),
+        "never_always_sample" => Some(OtelSamplerHookPolicy_OTEL_SAMPLER_HOOK_NEVER_ALWAYS_SAMPLE),
+        other => {
+            eprintln!(
+                "postgres_otel_tracing_demo: POSTGRES_OTEL_SAMPLER_HOOK_POLICY={other} unrecognized; \
+                 valid: hook_on_unsampled_bit, hook_always, never_respect_bit, never_always_sample"
+            );
+            None
+        }
+    }
 }
 
 /// Build an SDK Sampler from the OTEL_TRACES_SAMPLER env var, honouring

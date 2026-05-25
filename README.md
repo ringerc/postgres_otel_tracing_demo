@@ -97,9 +97,35 @@ and use the delegate sampler directly.
 
 If you want the OTel sampler to be able to **override** an
 upstream-sampled (`sampled=1`) bit — e.g. apply local rate limits
-to traces that arrived already sampled — see the "set_sampler_policy"
-section below for the four hook-invocation policies contrib/otel
-exposes.
+to traces that arrived already sampled — change the
+sampler-hook **invocation policy** (next section).
+
+### `POSTGRES_OTEL_SAMPLER_HOOK_POLICY` (non-standard)
+
+contrib/otel exposes a policy knob that controls WHEN the sampler
+hook gets called.  This is not an OTel-spec concept (W3C and the
+OTel SDK both treat the sampled bit as authoritative), so the env
+var carries a project-prefixed name.
+
+| Value | When the SDK sampler runs | When the W3C bit is respected |
+|-------|---------------------------|-------------------------------|
+| `hook_on_unsampled_bit` (default) | Only when wire `sampled=0` | `sampled=1` always records |
+| `hook_always` | Every span, regardless of wire bit | Sampler can override `sampled=1` |
+| `never_respect_bit` | Never (hook ignored) | `sampled=1` → record, `sampled=0` → drop |
+| `never_always_sample` | Never (hook ignored) | Wire bit ignored; record everything |
+
+Use cases:
+
+* `hook_on_unsampled_bit` — strict W3C compliance.  The default.
+* `hook_always` — you want local rate limits or tail-based sampling
+  to be able to drop traces that arrived already sampled.
+  Trade-off: violates the W3C "sampled=1 means downstream should
+  see this span" guarantee.
+* `never_respect_bit` — you trust the upstream's wire signal
+  exclusively; the sampler env vars become no-ops.  Lowest hot-
+  path cost.
+* `never_always_sample` — debug mode: record every span that
+  reached gate 4 (has propagated context).  Sampler is ignored.
 
 Set env vars in whatever launches postgres (systemd unit, docker compose,
 shell wrapper) so the postmaster inherits them.
