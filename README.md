@@ -140,15 +140,40 @@ This demo intentionally skips all that for simplicity; expect a
 follow-on (`postgres_otel_tracing` proper, dropping the `_demo`
 suffix) to do it right.
 
-### Force-set `TraceFlags::SAMPLED`
+### Force-set `TraceFlags::SAMPLED` on the SDK-side `SpanContext`
 
-`BatchSpanProcessor::on_end` silently drops any span whose
-`SpanContext.is_sampled()` returns false.  The W3C trace_flags byte that
-arrives in `OtelSpan` reflects the propagated client signal, which may
-have `sampled=0`.  contrib/otel's sampler has already decided to record
-the span by the time it reaches our emit hook, so we force `sampled=1` on
-the SpanContext we hand to the SDK.  The propagated flags are otherwise
-preserved.
+There are two distinct things commonly called "the sampled bit," and
+opentelemetry-rust conflates them:
+
+1. **W3C TraceContext wire signal.**  Bit 0 of `trace_flags` in the
+   `traceparent` header.  Says: "upstream is recording this trace; if
+   you want a continuous trace, you should too."  This is what
+   contrib/otel parses into `OtelSpan.trace_flags`.
+2. **opentelemetry-rust's local exporter gate.**  `SpanContext::
+   is_sampled()` reads the same bit, but the SDK uses the result to
+   answer a different question --- "should the local exporter
+   export this span?"  `BatchSpanProcessor::on_end` silently drops
+   any span where it returns false.
+
+In a vanilla opentelemetry-rust pipeline these collapse into one
+truth because the SDK's own sampler is what sets the bit.  Sampler
+decides RECORD_AND_SAMPLE → SDK writes the bit → exporter sees the
+bit and exports.  No drift possible.
+
+We bypassed the SDK's sampler.  contrib/otel made the recording
+decision in C and handed us a finished span.  The W3C bit on that
+span reflects whatever the upstream client put on the wire, which
+can be `00` even for spans contrib/otel definitely decided to
+record --- e.g. `otel.trace_all_queries=on` overrode an unsampled
+parent, or the sampler hook returned RECORD_AND_SAMPLE without the
+wire bit being set.
+
+If we passed that bit through unchanged, `BatchSpanProcessor::
+on_end` would drop spans contrib/otel intentionally recorded.  The
+fix is local to the SDK-side `SpanContext` we construct: force
+`TraceFlags::SAMPLED`.  The wire bit in `OtelSpan.trace_flags` is
+not touched (and is anyway not propagated anywhere by this demo);
+all we're doing is telling the SDK "yes, export this."
 
 ### `Pg_magic_func` exported via a C shim + Rust trampoline
 
