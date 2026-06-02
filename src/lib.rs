@@ -196,10 +196,33 @@ unsafe fn init_inner() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let api = &*api_ptr;
-    if api.version != OTEL_TRACING_API_VERSION {
+    // Two-stage version check, mirroring the OTEL_API_MAJOR /
+    // OTEL_API_MINOR convention in contrib/otel/otel_api.h.  Bindgen
+    // doesn't expose function-like macros, so we reproduce the
+    // halfword split inline.
+    //
+    //   - MAJOR (high halfword) must match exactly --- different
+    //     major means incompatible struct layout, force rebuild.
+    //   - MINOR (low halfword) must be >= what we were built against
+    //     --- a producer running an older minor than the consumer's
+    //     compile-time minor would have a shorter struct than we
+    //     expect to read.  Newer minors are fine because the
+    //     contract is additive-only (fields appended at the end).
+    let loaded_major = api.version >> 16;
+    let loaded_minor = api.version & 0xFFFF;
+    if loaded_major != OTEL_TRACING_API_MAJOR {
         return Err(format!(
-            "OtelTracingApi version mismatch: loaded={}, built-against={}",
-            api.version, OTEL_TRACING_API_VERSION
+            "OtelTracingApi version mismatch: loaded={}.{}, built-against={}.{} (incompatible major; rebuild required)",
+            loaded_major, loaded_minor,
+            OTEL_TRACING_API_MAJOR, OTEL_TRACING_API_MINOR
+        )
+        .into());
+    }
+    if loaded_minor < OTEL_TRACING_API_MINOR {
+        return Err(format!(
+            "OtelTracingApi minor-version too old: loaded={}.{}, built-against={}.{} (producer must be at least as recent as consumer's compile-time minor)",
+            loaded_major, loaded_minor,
+            OTEL_TRACING_API_MAJOR, OTEL_TRACING_API_MINOR
         )
         .into());
     }
