@@ -197,9 +197,7 @@ unsafe fn init_inner() -> Result<(), Box<dyn std::error::Error>> {
     }
     let api = &*api_ptr;
     // Two-stage version check, mirroring the OTEL_API_MAJOR /
-    // OTEL_API_MINOR convention in contrib/otel/otel_api.h.  Bindgen
-    // doesn't expose function-like macros, so we reproduce the
-    // halfword split inline.
+    // OTEL_API_MINOR convention in contrib/otel/otel_api.h:
     //
     //   - MAJOR (high halfword) must match exactly --- different
     //     major means incompatible struct layout, force rebuild.
@@ -208,8 +206,14 @@ unsafe fn init_inner() -> Result<(), Box<dyn std::error::Error>> {
     //     compile-time minor would have a shorter struct than we
     //     expect to read.  Newer minors are fine because the
     //     contract is additive-only (fields appended at the end).
-    let loaded_major = api.version >> 16;
-    let loaded_minor = api.version & 0xFFFF;
+    //
+    // Bindgen exposes OTEL_API_MAJOR_SHIFT and OTEL_API_MINOR_MASK
+    // as integer constants (object-like macros) so we don't need to
+    // hard-code 16 / 0xFFFF here.  The function-like
+    // OTEL_API_MAJOR(v) / OTEL_API_MINOR(v) macros aren't reachable
+    // from bindgen, so we apply the shift / mask ourselves.
+    let loaded_major = api.version >> OTEL_API_MAJOR_SHIFT;
+    let loaded_minor = api.version & OTEL_API_MINOR_MASK;
     if loaded_major != OTEL_TRACING_API_MAJOR {
         return Err(format!(
             "OtelTracingApi version mismatch: loaded={}.{}, built-against={}.{} (incompatible major; rebuild required)",
