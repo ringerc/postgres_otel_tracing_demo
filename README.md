@@ -43,17 +43,40 @@ is activated purely via `shared_preload_libraries`.
 
 ## Configuration
 
-Load order matters: `otel` MUST come before this module so the rendezvous
-variable is populated by the time we look for it.
+Load order matters.  Three modules in `shared_preload_libraries`, in
+order:
+
+* `otel` &mdash; the API/infrastructure module.  Publishes the
+  `OtelTracingApi` rendezvous variable that subsequent modules
+  consume.  Must come first.
+* `otel_postgres_tracing` &mdash; the query-instrumentation
+  consumer that actually produces statement spans via executor
+  hooks.  Without it, the demo exporter loads but never sees any
+  query spans (only any spans emitted directly via the producer
+  API).  Must come after `otel`.
+* `postgres_otel_tracing_demo` &mdash; this crate.  Locates the
+  api via the rendezvous variable and registers as a span
+  exporter.  Order relative to `otel_postgres_tracing` doesn't
+  matter for correctness as long as both come after `otel`, but
+  listing this last reads naturally.
 
 ```ini
 # postgresql.conf
-shared_preload_libraries = 'otel,postgres_otel_tracing_demo'
+shared_preload_libraries = 'otel,otel_postgres_tracing,postgres_otel_tracing_demo'
 
-# Optional: have contrib/otel produce a span for every query rather than
-# only for queries carrying a client-supplied traceparent.
+# Optional: emit a span for every query rather than only those
+# carrying a client-supplied traceparent.
 otel.trace_all_queries = on
 ```
+
+The earlier (pre-split) configuration that listed only
+`shared_preload_libraries = 'otel,postgres_otel_tracing_demo'` no
+longer produces query spans &mdash; the query-tracing hooks
+moved out of `contrib/otel` into the separate
+`contrib/otel_postgres_tracing` module.  See the
+[contrib/otel split design notes](doc/concepts/core-changes.md)
+(if a copy is in the repo) or the postgres tree's SGML docs for
+the split rationale.
 
 ### Environment variables
 

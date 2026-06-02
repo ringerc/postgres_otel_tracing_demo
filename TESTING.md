@@ -18,7 +18,7 @@ PGDATA=/tmp/pg_otel_demo_data
 rm -rf $PGDATA && /usr/local/pgsql/bin/initdb -D $PGDATA --auth=trust -U $USER
 
 cat >> $PGDATA/postgresql.auto.conf <<'EOF'
-shared_preload_libraries = 'otel,postgres_otel_tracing_demo'
+shared_preload_libraries = 'otel,otel_postgres_tracing,postgres_otel_tracing_demo'
 port = 54321
 logging_collector = off
 log_destination = 'stderr'
