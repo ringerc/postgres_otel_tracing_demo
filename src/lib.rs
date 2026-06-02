@@ -139,7 +139,13 @@ const PG_EPOCH_UNIX_SECS: i64 = 946_684_800;
 // the postgres process model.
 struct BackendState {
     processor: BatchSpanProcessor<TokioCurrentThread>,
-    instrumentation_scope: InstrumentationScope,
+    /// Fallback scope used when an OtelSpan arrives with scope =
+    /// NULL (e.g. a producer built against a stale header).  Named
+    /// after the Resource's service.name --- conceptually "the
+    /// postgres process produced this", since we have no better
+    /// identifier.  Spans whose C-side scope is non-NULL use the
+    /// producer's declared scope instead; see `build_scope`.
+    default_scope: InstrumentationScope,
     resource: Resource,
 }
 
@@ -407,13 +413,20 @@ fn build_backend_state(kind: ExporterKind) -> Result<BackendState, Box<dyn std::
     };
     processor.set_resource(&resource);
 
-    let instrumentation_scope = InstrumentationScope::builder("postgres_otel_tracing_demo")
-        .with_version(env!("CARGO_PKG_VERSION"))
-        .build();
+    // Fallback scope for spans that arrive with scope = NULL (a
+    // producer built against a stale header).  The OTel spec says
+    // the scope names the *producer* library; if the C side declined
+    // to declare one, the best we can do is name the postgres
+    // process via its service.name.
+    let default_scope_name = resource
+        .get(Key::new("service.name"))
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "postgres".to_string());
+    let default_scope = InstrumentationScope::builder(default_scope_name).build();
 
     Ok(BackendState {
         processor,
-        instrumentation_scope,
+        default_scope,
         resource,
     })
 }
@@ -601,8 +614,38 @@ fn translate(state: &BackendState, c: &OtelSpan) -> SpanData {
         events,
         links: SpanLinks::default(),
         status,
-        instrumentation_scope: state.instrumentation_scope.clone(),
+        instrumentation_scope: unsafe { build_scope(c.scope, &state.default_scope) },
     }
+}
+
+/// Materialise an OTel-SDK `InstrumentationScope` from the
+/// producer-side scope handle on the C OtelSpan.  When the handle
+/// is non-NULL we copy its (name, version, schema_url) into a fresh
+/// InstrumentationScope; when NULL --- a producer built against a
+/// stale header --- we fall back to the Resource-derived
+/// default_scope so the SDK still sees a valid scope.
+///
+/// Safety: caller must ensure `scope` is either NULL or a valid
+/// `OtelInstrumentationScope` pointer whose strings are valid
+/// NUL-terminated UTF-8 for the duration of this call.  contrib/otel
+/// owns the storage and keeps it valid for the backend's lifetime.
+unsafe fn build_scope(
+    scope: *const OtelInstrumentationScope,
+    fallback: &InstrumentationScope,
+) -> InstrumentationScope {
+    if scope.is_null() {
+        return fallback.clone();
+    }
+    let s = &*scope;
+    let name = c_str_or_empty(s.name);
+    let mut builder = InstrumentationScope::builder(name);
+    if !s.version.is_null() {
+        builder = builder.with_version(c_str_or_empty(s.version));
+    }
+    if !s.schema_url.is_null() {
+        builder = builder.with_schema_url(c_str_or_empty(s.schema_url));
+    }
+    builder.build()
 }
 
 unsafe fn c_str_or_empty(p: *const c_char) -> String {
