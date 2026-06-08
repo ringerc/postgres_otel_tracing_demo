@@ -13,67 +13,96 @@ context support to PostgreSQL.
 
 Branches:
 
-- **postgres submodule** (postgres patches): `postgres-otel-tracing`,
-  head `814e3d2317a`.  22-commit series on top of upstream
-  PostgreSQL master.
+- **postgres submodule** (postgres patches): `postgres-otel-tracing`
+  on `ringerc/postgres` (PR #1), 35-commit series.  Sits on top of
+  an octopus merge of three focused core PRs (#3, #4, #5) — see
+  list below.
 - **`ringerc/postgres_otel_tracing_demo`** (Rust out-of-tree
-  exporter): `main`, head `940a89a`.  9 commits.
+  exporter): `main`.
 
-Test coverage across both repos: **107 TAP subtests, all passing**,
-across five suites — `test_protocol_headers`, `libpq_headers`,
-`contrib/otel`, `otel_test_exporter`, `contrib/otel_exporter`.
+Test coverage across both repos: **all targeted TAP subtests
+passing** across the suites — `test_protocol_headers`,
+`libpq_headers`, `contrib/otel`, `otel_test_exporter`,
+`contrib/otel_postgres_tracing`.
 
 ---
 
 ## (a) Core PostgreSQL changes
 
-Eight commits in the postgres submodule touch core
-(`src/backend`, `src/include`, `src/interfaces/libpq`).  These are
-the changes that genuinely require upstream patches; everything
-else is contrib.
+The core work has been split into three focused upstream PRs
+against `ringerc/postgres`, each of which stands on its own
+merits.  All three are prerequisites for PR #1.
 
-```
-462011ca8d9  Add W3C Trace Context fields to elog/ereport
-38816e5536d  Add per-message protocol headers (RequestHeaders, 'M')
-b7d6f660a51  Add test_protocol_headers TAP test
-63d2eaa8d39  Affirmatively acknowledge _pq_.headers via ParameterStatus
-e9fa58bc6d1  libpq: add PQattachHeader / PQclearHeaders / PQheadersAvailable
-de27e9a13c0  doc: PQattachHeader, PQclearHeaders, PQheadersAvailable
-8baa656bd8e  libpq_headers: broader coverage for the headers client API
-2f313bf698c  Add contrib/otel: OpenTelemetry trace-context consumer
-```
+| PR | Branch | Content |
+|----|--------|---------|
+| [#3](https://github.com/ringerc/postgres/pull/3) | `core-protocol-headers` | Per-message protocol headers (`'M'` / `RequestHeaders`), lifecycle-free deferred-apply dispatcher, libpq `PQattachHeader` / `PQclearHeaders` / `PQheadersAvailable` client API. |
+| [#4](https://github.com/ringerc/postgres/pull/4) | `pre-ready-for-query-hook` | `pre_ready_for_query_hook` fired by `PostgresMain` just before each `ReadyForQuery`.  Independently useful; used by header consumers for statement-scope cleanup. |
+| [#5](https://github.com/ringerc/postgres/pull/5) | `core-elog-annotations` | Generic key/value annotations on `ErrorData` via `errannot()` / `errannotf()`; `%A` and `%{key}A` `log_line_prefix` escapes; JSON/CSV log surfacing. |
 
-(The last one introduces `contrib/otel` but does not modify core
-otherwise.)
+An earlier elog iteration shipped as
+[PR #2](https://github.com/ringerc/postgres/pull/2)
+(tracing-specific `errtrace()` + dedicated `trace_id` / `span_id` /
+`trace_flags` fields on `ErrorData`).  That has been superseded by
+PR #5's generic annotations approach — covers tracing today and
+any future observability dimension without further ABI carve-outs.
 
 ### Functional content
 
-1. **elog / ereport trace-context fields.** `ErrorData` gains
-   `trace_id` / `span_id` / `trace_flags`; new `errtrace()` helper;
+1. **elog / ereport structured annotations (PR #5).** `ErrorData`
+   gains an `ErrorAnnotation *annotations` list head; new
+   `errannot(key, value)` / `errannotf(key, fmt, ...)` helpers;
    full lifecycle plumbing through `CopyErrorData`,
    `ThrowErrorData`, `ReThrowError`, `FreeErrorDataContents`.
-   JSON log writer emits the fields as top-level keys; CSV log
-   gains three trailing columns; `log_line_prefix` gains `%T` and
-   `%S`.  No server→client wire-side emission — W3C propagation is
-   one-way by design.
+   Well-known key constants `ERRANNOT_KEY_TRACE_ID` /
+   `ERRANNOT_KEY_SPAN_ID` / `ERRANNOT_KEY_TRACE_FLAGS` so
+   producers share spellings.  Reserved-key handling for
+   collisions with core-owned JSON fields, surfaced through
+   `pg_rejected_annotations` so the rejection is diagnosable from
+   the log record without leaking the would-be value.
 
-2. **Per-message protocol headers (`'M'` / RequestHeaders).** New
-   wire-protocol message carrying namespaced `(key, value)`
-   entries.  Negotiated via `_pq_.headers=1` startup option, with
-   affirmative `protocol_features` `ParameterStatus` to defend
-   against pgbouncer-class proxies that silently strip the opt-in.
-   Extension API `RegisterProtocolHeaderHandler` with three scopes
-   (per-statement / per-transaction / per-session); server GUCs
-   gate the feature and bound header sizes.
+   JSON log writer emits each annotation as an additional
+   top-level key; CSV log gains one trailing JSON-encoded
+   annotations column; `log_line_prefix` gains `%A` (all
+   annotations) and `%{key}A` (single annotation by name).  No
+   server→client wire-side emission — W3C propagation is one-way
+   by design.
 
-3. **libpq client API.** `PQattachHeader` / `PQclearHeaders` /
-   `PQheadersAvailable`.  Pre-attach buffering model with
-   auto-flush at the start of each `PQsend*` operation.
-   StartupMessage always advertises `_pq_.headers=1`;
-   `headersAvailable` flips true only on receipt of the affirmative
-   `protocol_features` ParameterStatus.  Backward-compat fix in
-   `pqGetNegotiateProtocolVersion3` so libpq does not break against
-   feature-disabled or older servers.  SGML documentation added.
+2. **Per-message protocol headers (PR #3).** New wire-protocol
+   message `'M'` / RequestHeaders carrying namespaced
+   `(key, value)` entries.  Negotiated via `_pq_.headers=1`
+   startup option, with affirmative `protocol_features`
+   `ParameterStatus` to defend against pgbouncer-class proxies
+   that silently strip the opt-in.
+
+   Extension API `RegisterProtocolHeaderHandler(prefix, set_cb,
+   ctx)` is intentionally lifecycle-free — the core dispatcher
+   only routes entries; each extension owns its own state and
+   wires up its own cleanup via `RegisterXactCallback` (PR #3),
+   `on_proc_exit`, or `pre_ready_for_query_hook` (PR #4).
+
+   Dispatch is *deferred*: a received `'M'` is parsed and
+   atomically validated, then handlers fire at the start of the
+   next Query / Parse / Bind / Execute.  Binds handler errors to
+   the SQL operation the headers were intended to prefix.
+   Server GUCs gate the feature and bound header sizes; setting
+   either cap to 0 refuses the feature at handshake.
+
+3. **`pre_ready_for_query_hook` (PR #4).** Fired just before each
+   `ReadyForQuery`.  Independently useful for any extension that
+   needs end-of-command-cycle teardown; used by `contrib/otel` if
+   it ever needs statement-scope key support.
+
+4. **libpq client API (PR #3).** `PQattachHeader` /
+   `PQclearHeaders` / `PQheadersAvailable`.  Pre-attach buffering
+   model.  Each `PQexec*` / `PQsend*` flushes the queue only after
+   its own argument validation succeeds, so headers attached
+   ahead of a client-side rejection stay queued for the next
+   attempt instead of leaking onto the next successful command.
+   The wire-format Int16 entry count is bounded against silent
+   truncation.  StartupMessage always advertises `_pq_.headers=1`;
+   `headersAvailable` flips true only on receipt of the
+   affirmative `protocol_features` ParameterStatus.  SGML
+   documentation added.
 
 ### Test coverage (core)
 
@@ -87,33 +116,21 @@ otherwise.)
 
 Itemised with citations against the postgres source in
 [../concepts/core-changes.md](../concepts/core-changes.md).
-The short version: no extension hook exists for adding fields to
-`ErrorData`, for top-level keys in the JSON / CSV log writers, for
-`log_line_prefix` format letters, for new wire-protocol message
-types, for `_pq_.*` startup-option negotiation, or for libpq's
-StartupMessage / `PQsend*` paths.
+The short version: no extension hook exists for the `ErrorData`
+annotation list, for top-level keys in the JSON / CSV log writers,
+for `log_line_prefix` format letters, for new wire-protocol
+message types, for the wire-protocol round-trip boundary that
+backs statement-scope cleanup, for `_pq_.*` startup-option
+negotiation, or for libpq's StartupMessage / `PQsend*` paths.
 
 ---
 
 ## (b) `contrib/otel`
 
-The OpenTelemetry consumer of the headers mechanism.  Twelve
-commits, all in the postgres submodule under `contrib/otel/`.
-
-```
-2f313bf698c  Add contrib/otel: OpenTelemetry trace-context consumer
-63ec1339aed  contrib/otel: propagate trace context to parallel workers
-6dd507c4aac  contrib/otel: expand tracestate rationale + note baggage is out of scope
-48499c4c6e1  contrib/otel: span data model + exporter hook API; test exporter
-d1bf7cb354d  contrib/otel: span lifecycle via ExecutorStart/End hooks
-26026ea6da8  contrib/otel: capture ereport as span events
-c0725415ba7  contrib/otel: spans for utility commands via ProcessUtility_hook
-1527784f0d5  contrib/otel: built-in JSON log-line span emitter
-7cf6b83581d  contrib/otel: sampler hook + ParentBased default for unsampled traces
-216b148d5ab  contrib/otel: versioned rendezvous API + install header
-3912811838b  contrib/otel: configurable sampler-hook invocation policy
-6e3df8a7b4b  contrib/otel: document client-side SET / SET LOCAL propagation
-```
+The OpenTelemetry consumer of the headers mechanism, in
+`postgres-otel-tracing` (PR #1) on top of the three core PRs.
+`contrib/otel/` + `contrib/otel_postgres_tracing/` (the
+query-tracing module split off in Phase 4).
 
 ### Functional layers
 

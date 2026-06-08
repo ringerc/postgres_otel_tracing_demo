@@ -19,44 +19,63 @@ Each "why core" justification has been verified against the
 PostgreSQL source (master + this series). Citations are
 `file:line` against the postgres submodule.
 
-## A. elog / ereport: trace context as first-class structured log data
+## A. elog / ereport: structured annotations on log records
 
-- [ ] **`ErrorData` gains `trace_id`, `span_id`, `trace_flags` fields**
-      (`src/include/utils/elog.h:438`)
+- [ ] **`ErrorData` gains an `annotations` list head**
+      (`src/include/utils/elog.h`)
       *Compile-time struct layout; extensions cannot add fields, and
-      side-state would be invisible to core log writers.*
+      side-state would be invisible to core log writers.  A linked
+      list rather than fixed fields so the API generalizes to any
+      observability metadata, not just tracing.*
 
-- [ ] **`errtrace()` helper + lifecycle in `CopyErrorData` /
-      `ThrowErrorData` / `ReThrowError` / `FreeErrorDataContents`**
-      (`src/backend/utils/error/elog.c:1968`)
-      *These are plain functions with no hook points. The only
+- [ ] **`errannot()` / `errannotf()` helpers + lifecycle in
+      `CopyErrorData` / `ThrowErrorData` / `ReThrowError` /
+      `FreeErrorDataContents`**
+      (`src/backend/utils/error/elog.c`)
+      *These are plain functions with no hook points.  The only
       error-handling hook is `emit_log_hook`, which fires at message
-      emission — far past the lifecycle path. Needs the fields from
+      emission — far past the lifecycle path.  Needs the field from
       the previous item anyway.*
 
-- [ ] **JSON log writer emits `trace_id` / `span_id` / `trace_flags`
-      as top-level keys**
+- [ ] **Well-known annotation key constants exported from `elog.h`**
+      (`ERRANNOT_KEY_TRACE_ID`, `ERRANNOT_KEY_SPAN_ID`,
+      `ERRANNOT_KEY_TRACE_FLAGS`)
+      *Producers across the tree should agree on spellings; constants
+      live with the API to keep that contract enforceable.*
+
+- [ ] **Reserved-key handling: collisions with core-owned JSON top-
+      level fields are rejected and aggregated under
+      `pg_rejected_annotations`**
+      (`src/backend/utils/error/elog.c`)
+      *Annotations and JSON log fields share a flat namespace.  Core
+      owns the reservation list; an out-of-tree extension cannot
+      negotiate against future built-in additions.*
+
+- [ ] **JSON log writer emits each annotation as an additional
+      top-level key**
       (`src/backend/utils/error/jsonlog.c`)
       *`emit_log_hook` is observe-only with respect to logging: it
       can *suppress* core's writer by setting
-      `edata->output_to_server = false` (`elog.c:1945`), but cannot
-      supplement it or inject new top-level keys. Reimplementing the
-      JSON writer in a contrib means reimplementing the entire log
-      destination plumbing (file rotation, `log_destination`,
-      syslog/eventlog routing), and producing a non-standard schema
-      that log-aggregation pipelines won't recognize.*
+      `edata->output_to_server = false`, but cannot supplement it
+      or inject new top-level keys.  Reimplementing the JSON writer
+      in a contrib means reimplementing the entire log destination
+      plumbing (file rotation, `log_destination`, syslog/eventlog
+      routing), and producing a non-standard schema that log-
+      aggregation pipelines won't recognize.*
 
-- [ ] **CSV log writer appends three trailing columns**
-      (`src/backend/utils/error/csvlog.c:62`)
+- [ ] **CSV log writer appends one trailing annotations column**
+      (`src/backend/utils/error/csvlog.c`)
       *CSV column layout is hardcoded in the writer; no hook lets an
-      extension add columns. Same suppress-and-reimplement trade-off
-      as JSON.*
+      extension add columns.  Same suppress-and-reimplement trade-off
+      as JSON.  Column is JSON-encoded so the format stays stable as
+      the annotation surface grows.*
 
-- [ ] **`log_line_prefix` gains `%T` (trace-id) and `%S` (span-id)**
-      (`src/backend/utils/error/elog.c:3320`, the `log_status_format`
+- [ ] **`log_line_prefix` gains `%A` (all annotations) and
+      `%{key}A` (single annotation by name)**
+      (`src/backend/utils/error/elog.c`, the `log_status_format`
       switch)
       *Prefix formatter dispatches on format letters via a hardcoded
-      switch with no extension hook. Unknown letters are silently
+      switch with no extension hook.  Unknown letters are silently
       ignored.*
 
 ## B. Wire protocol: per-message trace context, zero added round trips
@@ -206,24 +225,37 @@ PostgreSQL source (master + this series). Citations are
       from `StartupMessage`, which requires the server to actually
       respond to negotiation, not just to a static GUC default.*
 
-- [ ] **Per-statement scope machinery + per-message lifecycle
-      clearing**
-      (`src/backend/tcop/postgres.c:4894`, the Parse/Bind/Execute
-      cases)
-      *Per-message scope is the part that genuinely requires core:
-      Parse, Bind, and Execute cases dispatch directly to their
-      handlers with no inter-message hook. `post_parse_analyze_hook`
-      and `ExecutorStart_hook` fire **during** message processing,
-      not **between** messages. Per-transaction and per-session
-      clearing, by contrast, **could** be done by a contrib using
-      `RegisterXactCallback` (`access/xact.h:495`) and
-      `on_proc_exit` (`storage/ipc.h:70`) — but only if the
-      contrib already had the headers, which requires the wire
-      changes above.*
+- [ ] **`pre_ready_for_query_hook` for statement-scope cleanup**
+      (`src/backend/tcop/postgres.c`, `src/include/tcop/tcopprot.h`)
+      *Fires just before each `ReadyForQuery`.  The wire-protocol
+      command-cycle boundary is the right granularity for header
+      effects that should not leak past one round-trip, and it
+      cannot be expressed by existing per-statement hooks
+      (`post_parse_analyze_hook`, `ExecutorEnd_hook`,
+      `ProcessUtility_hook`) — those fire mid-cycle for a
+      multi-statement simple Query.  Independently useful for any
+      extension that needs end-of-command-cycle teardown.*
 
-- [ ] **`RegisterProtocolHeaderHandler` extension API**
+- [ ] **Deferred dispatch: parse `'M'` on receipt, fire `set_cb`s
+      at the start of the next Query / Parse / Bind / Execute**
+      (`src/backend/libpq/protocol_headers.c`,
+      `src/backend/tcop/postgres.c` Q/P/B/E case entries)
+      *Binds a handler error to the SQL operation those headers
+      were intended to prefix.  If `set_cb` ran on receipt, a
+      handler `ERROR` would produce a standalone error, top-level
+      recovery would `ReadyForQuery`, and the client's pipelined
+      next operation would still run — with half-applied header
+      state.  Cannot be expressed without dispatching from inside
+      the Q/P/B/E case entries.*
+
+- [ ] **`RegisterProtocolHeaderHandler` extension API
+      (lifecycle-free signature: prefix + set_cb + ctx)**
       *The registry has to be invoked from the wire dispatch above;
-      once that's in core, the registry must live with it.*
+      once that's in core, the registry must live with it.  The
+      dispatcher is intentionally lifecycle-free — clear callbacks
+      and scope semantics are the extension's responsibility, wired
+      via `RegisterXactCallback`, `on_proc_exit`, and the new
+      `pre_ready_for_query_hook`.*
 
 - [ ] **Server GUCs gating the feature and bounding header sizes**
       *Extensions can define GUCs, but the feature-switch and
