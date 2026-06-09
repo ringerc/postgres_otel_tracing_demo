@@ -56,6 +56,12 @@ fn main() {
         .allowlist_var("FLOAT8PASSBYVAL")
         .allowlist_var("FMGR_ABI_EXTRA")
         .allowlist_function("find_rendezvous_variable")
+        // MarkGUCPrefixReserved("oteltracingdemo") --- we call this
+        // from _PG_init to claim the "oteltracingdemo." GUC namespace
+        // (currently unused but reserved for future demo-specific
+        // GUCs; also gets us the typo-protection warning if anyone
+        // sets an oteltracingdemo.* unknown).
+        .allowlist_function("MarkGUCPrefixReserved")
         // Make the generated structs Copy/Clone-friendly for our
         // FFI translation glue.  (Default = true for POD types
         // bindgen recognizes; explicit for clarity.)

@@ -258,9 +258,19 @@ unsafe fn init_inner() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // 3. Register the emit hook.  All SDK construction is deferred to
-    //    the backend (see emit_hook + ensure_backend) because threads
-    //    don't survive fork().
+    // 3. Claim the "oteltracingdemo." GUC namespace.  No GUCs are
+    //    defined in this module yet, but reserving the prefix at
+    //    init time means that if anyone ever sets an
+    //    "oteltracingdemo.something_typoed" in postgresql.conf,
+    //    postgres surfaces a warning and drops the placeholder
+    //    instead of silently retaining it.  Each ringerc otel
+    //    extension owns exactly one prefix matching its name; this
+    //    is the demo's slot.
+    MarkGUCPrefixReserved(b"oteltracingdemo\0".as_ptr() as *const c_char);
+
+    // 4. Register the emit hook.  All SDK construction is deferred
+    //    to the backend (see emit_hook + ensure_backend) because
+    //    threads don't survive fork().
     let mut prev_emit_out: otel_span_emit_hook_type = None;
     let register_emit = api
         .register_emit_hook
@@ -268,7 +278,7 @@ unsafe fn init_inner() -> Result<(), Box<dyn std::error::Error>> {
     register_emit(Some(emit_hook), &mut prev_emit_out);
     PREV_EMIT.set(prev_emit_out).ok();
 
-    // 4. Build the Sampler from OTEL_TRACES_SAMPLER + OTEL_TRACES_SAMPLER_ARG.
+    // 5. Build the Sampler from OTEL_TRACES_SAMPLER + OTEL_TRACES_SAMPLER_ARG.
     //    Register the sampler hook only if we built one --- if env asked
     //    for an unrecognized sampler we leave the slot empty and contrib/
     //    otel falls back to its OTel-SDK ParentBased default (drop on
@@ -283,7 +293,7 @@ unsafe fn init_inner() -> Result<(), Box<dyn std::error::Error>> {
         PREV_SAMPLER.set(prev_sampler_out).ok();
     }
 
-    // 5. Optionally override contrib/otel's sampler-hook invocation
+    // 6. Optionally override contrib/otel's sampler-hook invocation
     //    policy.  Recognized values for POSTGRES_OTEL_SAMPLER_HOOK_POLICY
     //    (the env-var name is non-standard --- the policy is a
     //    contrib/otel concept that doesn't map to anything in the

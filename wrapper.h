@@ -12,4 +12,5 @@
  */
 #include "postgres.h"
 #include "fmgr.h"
+#include "utils/guc.h"			/* MarkGUCPrefixReserved */
 #include <otel_api/otel.h>
