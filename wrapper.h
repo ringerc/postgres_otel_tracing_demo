@@ -12,4 +12,4 @@
  */
 #include "postgres.h"
 #include "fmgr.h"
-#include <otel/otel.h>
+#include <otel_api/otel.h>

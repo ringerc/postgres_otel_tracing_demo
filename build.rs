@@ -36,7 +36,7 @@ fn main() {
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")
         // -I.../server lets wrapper.h find postgres.h, fmgr.h, etc.
-        // -I.../server/extension lets <otel/otel.h> resolve (other
+        // -I.../server/extension lets <otel_api/otel.h> resolve (other
         // contribs that install headers go in there too).
         .clang_arg(format!("-I{}", server_inc))
         .clang_arg(format!("-I{}/extension", server_inc))
@@ -65,7 +65,7 @@ fn main() {
         // a C compiler in test mode which complicates packaging.
         .layout_tests(false)
         .generate()
-        .expect("bindgen failed to generate FFI for <otel/otel.h>");
+        .expect("bindgen failed to generate FFI for <otel_api/otel.h>");
 
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
     bindings

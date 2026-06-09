@@ -177,7 +177,7 @@ query-tracing module split off in Phase 4).
    policy landed).  Strict-equality version check: existing
    consumers need a rebuild against the new header but their
    source is unchanged.  Header (`otel.h`) is installed into
-   `$(pg_config --includedir-server)/extension/otel/`.
+   `$(pg_config --includedir-server)/extension/otel_api/`.
 
 ### Test coverage (`contrib/otel`)
 

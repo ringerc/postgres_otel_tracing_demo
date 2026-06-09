@@ -29,7 +29,7 @@ This crate is the worked example of how an out-of-tree module plugs in:
 ## Requirements
 
 * PostgreSQL with `contrib/otel` installed (header lives at
-  `$(pg_config --includedir-server)/extension/otel/otel.h`).  Stock
+  `$(pg_config --includedir-server)/extension/otel_api/otel.h`).  Stock
   upstream postgres works; see the matrix below for what changes
   when the optional core patches are also applied.
 * Rust toolchain (stable, edition 2021).
@@ -107,23 +107,24 @@ is activated purely via `shared_preload_libraries`.
 Load order matters.  Three modules in `shared_preload_libraries`, in
 order:
 
-* `otel` &mdash; the API/infrastructure module.  Publishes the
+* `otel_api` &mdash; the API/infrastructure module.  Publishes the
   `OtelTracingApi` rendezvous variable that subsequent modules
-  consume.  Must come first.
+  consume.  Must come first.  Distributed via
+  [ringerc/postgres_otel_api](https://github.com/ringerc/postgres_otel_api).
 * `otel_postgres_tracing` &mdash; the query-instrumentation
   consumer that actually produces statement spans via executor
   hooks.  Without it, the demo exporter loads but never sees any
   query spans (only any spans emitted directly via the producer
-  API).  Must come after `otel`.
+  API).  Must come after `otel_api`.
 * `postgres_otel_tracing_demo` &mdash; this crate.  Locates the
   api via the rendezvous variable and registers as a span
   exporter.  Order relative to `otel_postgres_tracing` doesn't
-  matter for correctness as long as both come after `otel`, but
-  listing this last reads naturally.
+  matter for correctness as long as both come after `otel_api`,
+  but listing this last reads naturally.
 
 ```ini
 # postgresql.conf
-shared_preload_libraries = 'otel,otel_postgres_tracing,postgres_otel_tracing_demo'
+shared_preload_libraries = 'otel_api,otel_postgres_tracing,postgres_otel_tracing_demo'
 
 # Optional: emit a span for every query rather than only those
 # carrying a client-supplied traceparent.
@@ -133,8 +134,9 @@ otel.trace_all_queries = on
 The earlier (pre-split) configuration that listed only
 `shared_preload_libraries = 'otel,postgres_otel_tracing_demo'` no
 longer produces query spans &mdash; the query-tracing hooks
-moved out of `contrib/otel` into the separate
-`contrib/otel_postgres_tracing` module.  See the
+moved out of `otel_api` (formerly `contrib/otel`) into the
+separate `otel_postgres_tracing` module, and the API module's
+name itself bumped from `otel` to `otel_api`.  See the
 [contrib/otel split design notes](doc/concepts/core-changes.md)
 (if a copy is in the repo) or the postgres tree's SGML docs for
 the split rationale.

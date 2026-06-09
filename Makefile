@@ -40,7 +40,7 @@ install: build
 	install -m 755 $(CRATE_LIB) $(INSTALLED_LIB)
 	@echo
 	@echo "Installed: $(INSTALLED_LIB)"
-	@echo "Add 'otel,postgres_otel_tracing_demo' to shared_preload_libraries"
+	@echo "Add 'otel_api,otel_postgres_tracing,postgres_otel_tracing_demo' to shared_preload_libraries"
 	@echo "(otel MUST come first; postgres_otel_tracing_demo locates it via"
 	@echo " the OtelTracingApi rendezvous variable at _PG_init time)."
 
