@@ -17,14 +17,24 @@ crate-type = ["cdylib"]
 # single minor; the OTel-rust ecosystem still occasionally reshuffles
 # types across minors so we don't want cargo silently upgrading.
 opentelemetry = "0.27"
-opentelemetry_sdk = { version = "0.27", features = ["trace", "rt-tokio-current-thread"] }
+opentelemetry_sdk = { version = "0.27", features = ["trace", "rt-tokio"] }
 opentelemetry-stdout = { version = "0.27", features = ["trace"] }
 opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "trace"] }
 
-# Async runtime used by BatchSpanProcessor.  current_thread flavor only
-# (single-threaded executor) to avoid spawning worker pools inside a
-# postgres backend; see the design notes in README for rationale.
-tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
+# Async runtime used by BatchSpanProcessor.  Multi-thread flavor with one
+# worker so the tonic exporter's hyper-based HTTP/2 client has a live
+# reactor driving its socket I/O.  A current-thread runtime would make
+# no progress unless something blocked in `block_on`, which a synchronous
+# postgres backend never does --- so the previous "rt-tokio-current-thread"
+# choice panicked on every OTLP export with "no reactor running".  See
+# the README's "Per-backend SDK" section for the per-backend rationale.
+#
+# Features:
+#   rt-multi-thread --- the multi-worker scheduler
+#   net             --- needed by tonic's TcpStream / TLS plumbing
+#   time            --- BatchSpanProcessor's flush timer + tonic timeouts
+#   sync, macros    --- channels, ::pin!, etc., used by the SDK
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
 
 # Lazy global initialization.
 once_cell = "1"

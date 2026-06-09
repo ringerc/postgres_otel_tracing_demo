@@ -41,7 +41,7 @@ use opentelemetry::{
 use opentelemetry_sdk::{
     export::trace::SpanData,
     resource::{EnvResourceDetector, ResourceDetector, TelemetryResourceDetector},
-    runtime::TokioCurrentThread,
+    runtime::Tokio,
     trace::{BatchSpanProcessor, Sampler, ShouldSample, SpanEvents, SpanLinks, SpanProcessor},
     Resource,
 };
@@ -135,10 +135,21 @@ const PG_EPOCH_UNIX_SECS: i64 = 946_684_800;
 //
 // All SDK construction happens lazily in the emit hook, inside
 // each backend process, via thread_local!.  Per-backend overhead
-// is one worker thread + one exporter connection, which matches
-// the postgres process model.
+// is one Tokio worker thread + one exporter connection, which
+// matches the postgres process model.
+//
+// _runtime field: opentelemetry_otlp's tonic transport (HTTP/2 over
+// hyper) requires a live Tokio reactor.  We build a multi-thread
+// runtime with one worker per backend; its worker thread polls
+// tonic's I/O and the BatchSpanProcessor's flush timer
+// autonomously, so the synchronous emit_hook just calls .on_end()
+// and the worker takes over.  Keeping the Runtime alive in
+// BackendState (which is Box::leak'd to 'static, see ensure_backend)
+// is what stops the reactor from being torn down before the final
+// proc_exit flush.
 struct BackendState {
-    processor: BatchSpanProcessor<TokioCurrentThread>,
+    _runtime: tokio::runtime::Runtime,
+    processor: BatchSpanProcessor<Tokio>,
     instrumentation_scope: InstrumentationScope,
     resource: Resource,
 }
@@ -392,17 +403,40 @@ fn build_backend_state(kind: ExporterKind) -> Result<BackendState, Box<dyn std::
         Resource::new([KeyValue::new("service.name", "postgres")]).merge(&env_resource)
     };
 
-    let mut processor: BatchSpanProcessor<TokioCurrentThread> = match kind {
+    // One Tokio runtime per backend.  Multi-thread with one worker:
+    //   - tonic's hyper-util needs a live reactor; multi-thread always
+    //     has at least one polling thread.  current-thread would only
+    //     make progress when someone block_on'd, which the synchronous
+    //     postgres emit_hook never does --- that's the bug this fixes.
+    //   - one worker is enough: span export is bursty, not throughput-
+    //     bound, and we don't want to multiply OS thread counts in a
+    //     postgres process.
+    // Built post-fork (we're called from ensure_backend, which only
+    // runs in backends), so its worker thread is born in this process
+    // and won't be lost to a fork.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all() // enable_io + enable_time, both needed by tonic
+        .thread_name("pg-otel-demo")
+        .build()?;
+
+    // Enter the runtime so BatchSpanProcessor::builder().build() spawns
+    // its worker task onto our runtime, and so the tonic exporter
+    // builder can grab the Handle.  The guard is dropped at end of
+    // scope; the runtime keeps polling via its worker threads.
+    let _guard = runtime.enter();
+
+    let mut processor: BatchSpanProcessor<Tokio> = match kind {
         ExporterKind::None => return Err("ExporterKind::None reached build_backend_state".into()),
         ExporterKind::Otlp => {
             let exporter = opentelemetry_otlp::SpanExporter::builder()
                 .with_tonic()
                 .build()?;
-            BatchSpanProcessor::builder(exporter, TokioCurrentThread).build()
+            BatchSpanProcessor::builder(exporter, Tokio).build()
         }
         ExporterKind::Stdout => {
             let exporter = opentelemetry_stdout::SpanExporter::default();
-            BatchSpanProcessor::builder(exporter, TokioCurrentThread).build()
+            BatchSpanProcessor::builder(exporter, Tokio).build()
         }
     };
     processor.set_resource(&resource);
@@ -411,7 +445,9 @@ fn build_backend_state(kind: ExporterKind) -> Result<BackendState, Box<dyn std::
         .with_version(env!("CARGO_PKG_VERSION"))
         .build();
 
+    drop(_guard);
     Ok(BackendState {
+        _runtime: runtime,
         processor,
         instrumentation_scope,
         resource,

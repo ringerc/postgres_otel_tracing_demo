@@ -236,11 +236,19 @@ state: one provider, one batch processor, one exporter connection,
 threads shared across the whole workload.  We are using it
 backwards — every backend pays for its own:
 
-* tokio current-thread runtime (one OS thread per active backend)
-* BatchSpanProcessor worker + bounded channel
-* exporter state (for OTLP: its own gRPC connection, TLS handshake,
-  HTTP/2 stream multiplex)
-* Resource detection (env-var parsing, default-detector logic)
+| Per-backend cost | Threads | Resident memory (rough order) | Notes |
+|---|---|---|---|
+| Tokio multi-thread runtime | 1 worker | ~1–2 MiB stack + scheduler state | Built by `build_backend_state`; one worker is enough for the tonic exporter's I/O. See [Why multi-thread instead of current-thread](#why-multi-thread-tokio-runtime). |
+| `BatchSpanProcessor` worker task | 0 (runs on the runtime worker) | a few KiB (channel + state) | Bounded channel of `SpanData`. |
+| OTLP/tonic exporter | 0 | hyper HTTP/2 client state, one TCP conn, TLS context, transient send buffers | One gRPC connection per backend — see "TLS handshake amplification" below. |
+| `opentelemetry-stdout` exporter (when `OTEL_TRACES_EXPORTER=stdout`) | 0 | negligible | Synchronous, no socket. |
+| `Resource` (service.name, env-derived attrs) | 0 | a few KiB | Built once at backend startup. |
+| Postgres backend itself, for reference | (its own) | ~5–10 MiB+ | What our overhead is being measured against. |
+
+Steady-state CPU: minimal at idle — the Tokio worker parks; the
+exporter's reactor is event-driven. Under load it's roughly
+"flush-rate × OTLP serialisation cost + one round-trip's worth of
+HTTP/2 framing per batch."
 
 At idle these costs are noise; under load (hundreds of concurrent
 backends, especially with frequent connect/disconnect) they add up:
@@ -248,6 +256,36 @@ RAM per backend creeps, every short-lived backend pays the OTLP
 TLS handshake on its way to also dropping its last in-flight batch,
 the collector sees N tiny streams instead of one fat one, and
 batching becomes per-backend rather than across the cluster.
+
+#### Why multi-thread Tokio runtime
+
+The exporter's gRPC transport is tonic, which uses hyper, which
+requires a live Tokio reactor to drive its socket I/O. A
+`current_thread` runtime makes no progress unless **something is
+blocked in `block_on`** — which a synchronous postgres backend never
+does. Earlier versions of this code used
+`rt-tokio-current-thread` + a `tokio::runtime` flagged with only
+`["rt", "time", "sync", "macros"]`, and every export call panicked
+with `"there is no reactor running"` because nothing was ever driving
+the runtime. The stdout exporter masked this because its `export()` is
+synchronous (just writes to a file descriptor) and never asks the
+reactor for anything.
+
+Switching to `rt-tokio` + a multi-thread Tokio runtime built inside
+`build_backend_state` gives every backend its own worker thread that
+polls the exporter autonomously. The synchronous emit-hook can just
+call `processor.on_end(data)` and the worker picks the batch up from
+the channel without any block_on. Per-backend overhead is the one
+extra OS thread shown in the table above.
+
+#### TLS handshake amplification
+
+The OTLP/tonic exporter establishes its gRPC connection on first use
+in each backend. With many short-lived connections (a common postgres
+deployment pattern), every backend pays one TLS handshake on startup
+and tears the connection down at exit, multiplying handshake count by
+fork rate. The collector sees N small streams instead of one fat
+one. The "fix for production use" below addresses this directly.
 
 **The fix for production use** is the standard postgres pattern: a
 single background worker owns the SDK, and backends hand spans off
