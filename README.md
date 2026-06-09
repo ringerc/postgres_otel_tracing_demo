@@ -4,7 +4,10 @@ A demo PostgreSQL extension that consumes spans from `contrib/otel` and ships
 them through the **real `opentelemetry-rust` SDK** — to stdout (default) or to
 an OTLP collector via gRPC.
 
-Requires [patched postgres + `contrib/otel`](https://github.com/ringerc/postgres/pull/1)
+Builds against **stock postgres** (19devel / `master`) with `contrib/otel`
+installed, OR against [patched postgres](https://github.com/ringerc/postgres/pull/1)
+for the full trace-context and log-correlation feature set.  See
+[Patched vs unpatched postgres](#patched-vs-unpatched-postgres) below.
 
 Status: proof-of-concept, smoke-tested against postgres 19devel.
 
@@ -26,9 +29,67 @@ This crate is the worked example of how an out-of-tree module plugs in:
 ## Requirements
 
 * PostgreSQL with `contrib/otel` installed (header lives at
-  `$(pg_config --includedir-server)/extension/otel/otel.h`).
+  `$(pg_config --includedir-server)/extension/otel/otel.h`).  Stock
+  upstream postgres works; see the matrix below for what changes
+  when the optional core patches are also applied.
 * Rust toolchain (stable, edition 2021).
 * `pg_config` on `$PATH`, or `PG_CONFIG=/path/to/pg_config` in your env.
+
+### Patched vs unpatched postgres
+
+`contrib/otel` and this demo are designed to build against an
+unpatched server.  Two optional core-postgres patch series unlock
+additional capabilities; `contrib/otel`'s Makefile / `meson.build`
+detect them at compile time and adapt automatically.
+
+| Feature | Stock postgres | + [PR #3][pr3] | + [PR #5][pr5] |
+|---------|----------------|----------------|----------------|
+| Build `contrib/otel` and this demo | Yes | Yes | Yes |
+| Statement spans via executor hooks | Yes | Yes | Yes |
+| Trace context via `SET otel.traceparent` | Yes | Yes | Yes |
+| Trace context via [sqlcommenter][sqlc] comments | Yes | Yes | Yes |
+| Trace context via the `M` (RequestHeaders) protocol message | — | Yes | Yes |
+| Structured trace context in JSON / CSV log output | — | — | Yes |
+| `%A` / `%{trace_id}A` `log_line_prefix` escapes | — | — | Yes |
+| Textual `trace_id=...` fallback appended to log `CONTEXT:` | Yes (always-on fallback) | Yes | — (superseded) |
+
+[pr3]: https://github.com/ringerc/postgres/pull/3 "core: protocol headers ('M' message + _pq_.headers negotiation)"
+[pr5]: https://github.com/ringerc/postgres/pull/5 "core: generic key/value annotations on ErrorData"
+
+Patch series, in dependency order:
+
+* **[PR #3][pr3] — protocol headers.**  Adds the `'M'`
+  (RequestHeaders) frontend message, the `_pq_.headers=1` startup
+  negotiation, and the `RegisterProtocolHeaderHandler` extension
+  API.  `contrib/otel` registers an `otel.` prefix handler so
+  clients can attach `traceparent` / `tracestate` to each query
+  out-of-band, without having to put trace context inside the SQL
+  text (sqlcommenter) or burn a round-trip on `SET`.  Depends on
+  [PR #4][pr4] (`pre_ready_for_query_hook`) only for
+  statement-scope semantics, which `contrib/otel` does not
+  currently use.
+* **[PR #5][pr5] — elog annotations.**  Adds a generic
+  key/value annotations list on `ErrorData`, the `errannot()` /
+  `errannotf()` helpers, structured emission through the JSON and
+  CSV log writers, and `%A` / `%{key}A` escapes in
+  `log_line_prefix`.  `contrib/otel` attaches `trace_id`,
+  `span_id`, `trace_flags` as annotations under well-known keys so
+  operators can correlate log lines to traces in any log format.
+  Without this patch, `contrib/otel` falls back to appending a
+  textual `trace_id=... span_id=... trace_flags=...` line to
+  `edata->context`, which still surfaces in stderr / syslog log
+  output but isn't structured.
+
+[pr4]: https://github.com/ringerc/postgres/pull/4 "core: pre_ready_for_query_hook"
+[sqlc]: https://google.github.io/sqlcommenter/
+
+Detection mechanism (informational): `contrib/otel`'s build
+probes the installed server headers for `libpq/protocol_headers.h`
+and for an `errannot` prototype in `utils/elog.h`, and defines
+`-DOTEL_HAVE_PROTOCOL_HEADERS` / `-DOTEL_HAVE_ERRANNOT`
+accordingly.  No configure step or feature flags are required on
+the consumer side; this demo links against the same headers and
+inherits the matching code paths.
 
 ## Build & install
 
