@@ -21,8 +21,8 @@ Branches:
   exporter): `main`.
 
 Test coverage across both repos: **all targeted TAP subtests
-passing** across the suites — `test_protocol_headers`,
-`libpq_headers`, `contrib/otel`, `otel_test_exporter`,
+passing** across the suites — `test_trace_context`,
+`libpq_trace_context`, `contrib/otel`, `otel_test_exporter`,
 `contrib/otel_postgres_tracing`.
 
 ---
@@ -35,8 +35,8 @@ merits.  All three are prerequisites for PR #1.
 
 | PR | Branch | Content |
 |----|--------|---------|
-| [#3](https://github.com/ringerc/postgres/pull/3) | `core-protocol-headers` | Per-message protocol headers (`'M'` / `RequestHeaders`), lifecycle-free deferred-apply dispatcher, libpq `PQattachHeader` / `PQclearHeaders` / `PQheadersAvailable` client API. |
-| [#4](https://github.com/ringerc/postgres/pull/4) | `pre-ready-for-query-hook` | `pre_ready_for_query_hook` fired by `PostgresMain` just before each `ReadyForQuery`.  Independently useful; used by header consumers for statement-scope cleanup. |
+| [#3](https://github.com/ringerc/postgres/pull/3) | `core-trace-context` | Single-purpose `TraceContext` message (`'M'`), apply-on-receipt dispatcher, protocol 3.3 negotiation, `RegisterTraceContextHandler` extension API, libpq `PQsetTraceContext` / `PQattachTraceContext` / `PQtraceContextAvailable` client API. |
+| [#4](https://github.com/ringerc/postgres/pull/4) | `pre-ready-for-query-hook` | `pre_ready_for_query_hook` fired by `PostgresMain` just before each `ReadyForQuery`.  Independently useful; core now drives the trace-context RFQ clear via `clear_cb` directly, so `contrib/otel` no longer relies on this hook for trace-context scope. |
 | [#5](https://github.com/ringerc/postgres/pull/5) | `core-elog-annotations` | Generic key/value annotations on `ErrorData` via `errannot()` / `errannotf()`; `%A` and `%{key}A` `log_line_prefix` escapes; JSON/CSV log surfacing. |
 
 An earlier elog iteration shipped as
@@ -67,50 +67,53 @@ any future observability dimension without further ABI carve-outs.
    server→client wire-side emission — W3C propagation is one-way
    by design.
 
-2. **Per-message protocol headers (PR #3).** New wire-protocol
-   message `'M'` / RequestHeaders carrying namespaced
-   `(key, value)` entries.  Negotiated via `_pq_.headers=1`
-   startup option, with affirmative `protocol_features`
-   `ParameterStatus` to defend against pgbouncer-class proxies
-   that silently strip the opt-in.
+2. **Single-purpose TraceContext message (PR #3).** New
+   wire-protocol message `'M'` / `TraceContext` carrying exactly
+   two fixed W3C fields: `traceparent` and `tracestate` as
+   NUL-terminated strings (no open key/value entry list).
+   Negotiated via a minor protocol version bump to 3.3 using the
+   standard min/max negotiation; `NegotiateProtocolVersion` handles
+   downgrade for older servers.  The startup-option opt-in and the
+   affirmative acknowledgement `ParameterStatus` from the earlier
+   design are removed.
 
-   Extension API `RegisterProtocolHeaderHandler(prefix, set_cb,
-   ctx)` is intentionally lifecycle-free — the core dispatcher
-   only routes entries; each extension owns its own state and
-   wires up its own cleanup via `RegisterXactCallback` (PR #3),
-   `on_proc_exit`, or `pre_ready_for_query_hook` (PR #4).
-
-   Dispatch is *deferred*: a received `'M'` is parsed and
-   atomically validated, then handlers fire at the start of the
-   next Query / Parse / Bind / Execute.  Binds handler errors to
-   the SQL operation the headers were intended to prefix.
-   Server GUCs gate the feature and bound header sizes; setting
-   either cap to 0 refuses the feature at handshake.
+   Extension API `RegisterTraceContextHandler(apply_cb, clear_cb,
+   ctx)` — single consumer, no prefix, no registry.  `apply_cb`
+   fires on receipt of each `'M'` (top-level-command state only);
+   `clear_cb` fires from the ReadyForQuery emission path in core.
+   Trace context is advisory: a malformed `traceparent` value is
+   silently ignored (operation proceeds untagged); a malformed
+   wire frame is a protocol violation.  A single kill-switch GUC
+   `trace_context_enabled` (default on); no size/count GUCs.
 
 3. **`pre_ready_for_query_hook` (PR #4).** Fired just before each
    `ReadyForQuery`.  Independently useful for any extension that
-   needs end-of-command-cycle teardown; used by `contrib/otel` if
-   it ever needs statement-scope key support.
+   needs end-of-command-cycle teardown.  For trace context, core
+   now drives the RFQ clear directly via `clear_cb`; `contrib/otel`
+   no longer relies on this hook for trace-context scope.
 
-4. **libpq client API (PR #3).** `PQattachHeader` /
-   `PQclearHeaders` / `PQheadersAvailable`.  Pre-attach buffering
-   model.  Each `PQexec*` / `PQsend*` flushes the queue only after
-   its own argument validation succeeds, so headers attached
-   ahead of a client-side rejection stay queued for the next
-   attempt instead of leaking onto the next successful command.
-   The wire-format Int16 entry count is bounded against silent
-   truncation.  StartupMessage always advertises `_pq_.headers=1`;
-   `headersAvailable` flips true only on receipt of the
-   affirmative `protocol_features` ParameterStatus.  SGML
-   documentation added.
+4. **libpq client API (PR #3).** `PQsetTraceContext` /
+   `PQattachTraceContext` / `PQtraceContextAvailable`.
+   - `PQsetTraceContext` arms the connection: libpq re-emits one
+     `'M'` at the start of each subsequent pipeline until
+     disarmed.  Pass `traceparent = NULL` to disarm.
+   - `PQattachTraceContext` is one-shot: emits one `'M'` before
+     the next pipeline, then stops.
+   - `PQtraceContextAvailable` returns 1 when the negotiated
+     protocol is ≥ 3.3 (`conn->pversion`); the bespoke
+     `headersAvailable` flag is removed.  SGML documentation
+     added.
 
 ### Test coverage (core)
 
-- `test_protocol_headers/001_headers` — wire-level negotiation,
-  dispatch, scope clearing, ParameterStatus acknowledgement.
-- `libpq_headers/001_libpq_headers` — `PQheadersAvailable` both
-  modes, attach + send, clear, queue reset, NULL-key defence, and
-  the feature-disabled-server fallback path with server restart.
+- `test_trace_context/001_trace_context` — wire-level negotiation
+  (3.3 vs. 3.2-capped downgrade), apply-on-receipt, until-RFQ
+  scope, mid-window override, `SET otel_api.traceparent` survives
+  RFQ clear, advisory malformed-value handling.
+- `libpq_trace_context/001_libpq_trace_context` —
+  `PQtraceContextAvailable` both modes, `PQsetTraceContext` armed
+  re-emit across RFQ boundaries, `PQattachTraceContext` one-shot,
+  disarm, and the feature-disabled-server fallback path.
 
 ### Why these had to be in core, not contrib
 
@@ -120,8 +123,8 @@ The short version: no extension hook exists for the `ErrorData`
 annotation list, for top-level keys in the JSON / CSV log writers,
 for `log_line_prefix` format letters, for new wire-protocol
 message types, for the wire-protocol round-trip boundary that
-backs statement-scope cleanup, for `_pq_.*` startup-option
-negotiation, or for libpq's StartupMessage / `PQsend*` paths.
+backs statement-scope cleanup, for protocol-version negotiation
+in startup, or for libpq's StartupMessage / `PQsend*` paths.
 
 ---
 
@@ -134,13 +137,18 @@ query-tracing module split off in Phase 4).
 
 ### Functional layers
 
-1. **Trace-context ingestion.** Registers an `_otel.*` protocol
-   header handler.  `traceparent` / `tracestate` arriving in `'M'`
-   messages land in the custom GUCs `otel.traceparent` and
-   `otel.tracestate`.  These are `PGC_USERSET`, so client-side
-   `SET` / `SET LOCAL` is also supported as a fallback for clients
-   that lack `'M'` support — with the round-trip / scope /
-   pooler-leak caveats documented inline in `contrib/otel/otel.c`.
+1. **Trace-context ingestion.** Registers a single
+   `RegisterTraceContextHandler` consumer (`otel_trace_context_apply_cb`
+   / `otel_trace_context_clear_cb`).  `traceparent` / `tracestate`
+   arriving in `'M'` messages land in the custom GUCs
+   `otel_api.traceparent` and `otel_api.tracestate` via
+   `set_config_option`; `clear_cb` resets them at each RFQ
+   boundary, but only for `'M'`-installed context — an internal
+   flag prevents clobbering a user's `SET otel_api.traceparent`.
+   These GUCs are `PGC_USERSET`, so client-side `SET` / `SET LOCAL`
+   is also supported as a fallback for clients that lack `'M'`
+   support — with the round-trip / scope / pooler-leak caveats
+   documented inline in `contrib/otel/otel.c`.
    SQL introspection via `otel_current_traceparent()`.
 
 2. **Parallel-worker propagation.** Falls out of the GUC choice —
@@ -347,11 +355,15 @@ it only talks to the rendezvous API, which is plain C.
    actively damages client-side prepared-statement caches that key
    on raw SQL text — see the "Concrete motivation" subsection of
    B.6 in `core-changes.md`.
-3. **Generic protocol-headers framework, not a one-off
-   `_pq_.traceparent`.** Class-of-problems shape, mirroring
-   HTTP/2 / gRPC / AMQP precedent.  Future use-cases (audit,
-   log-control flags, IDS hints) slot in without further wire
-   changes.
+3. **Single-purpose `TraceContext` message, not a generic
+   key/value headers framework.** The earlier generic-headers
+   design accreted a registry, four lifecycle scopes, proxy-flag
+   lattice, and replay-at-every-binding-target machinery in service
+   of generality no second consumer has yet asked for.  The
+   decision was reversed: collapse to a closed, otel-owned field
+   set (`traceparent`, `tracestate`), one scope, no registry.  A
+   generic mechanism can be reintroduced later if a second consumer
+   materialises, without the cost of shipping it now.
 4. **`'M'` as the chosen message byte** (`'H'` was already taken
    for Flush and CopyOutResponse).
 5. **GUCs as canonical state for contrib/otel.** Buys parallel-
@@ -359,9 +371,10 @@ it only talks to the rendezvous API, which is plain C.
    bespoke parallel-state plumbing.  Also opens the door to client
    `SET` / `SET LOCAL` as a documented fallback path (with the
    three failure modes documented in `core-changes.md` B.6).
-6. **Affirmative `ParameterStatus`** rather than
-   absence-of-`NegotiateProtocolVersion` as the libpq "feature is
-   available" signal — defends against pgbouncer-class strippers.
+6. **Protocol version 3.3 as the availability signal** rather than
+   a bespoke `ParameterStatus` or startup-option opt-in.  Reuses
+   standard min/max negotiation; `PQtraceContextAvailable` checks
+   `conn->pversion >= 3.3` rather than a separate flag.
 7. **contrib/otel deliberately does NOT handle baggage.** W3C
    Baggage is a separate spec with a different audience,
    namespace, and size budget — a sibling `contrib/baggage` is

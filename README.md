@@ -48,26 +48,30 @@ detect them at compile time and adapt automatically.
 | Statement spans via executor hooks | Yes | Yes | Yes |
 | Trace context via `SET otel.traceparent` | Yes | Yes | Yes |
 | Trace context via [sqlcommenter][sqlc] comments | Yes | Yes | Yes |
-| Trace context via the `M` (RequestHeaders) protocol message | — | Yes | Yes |
+| Trace context via the `M` (TraceContext) protocol message | — | Yes | Yes |
 | Structured trace context in JSON / CSV log output | — | — | Yes |
 | `%A` / `%{trace_id}A` `log_line_prefix` escapes | — | — | Yes |
 | Textual `trace_id=...` fallback appended to log `CONTEXT:` | Yes (always-on fallback) | Yes | — (superseded) |
 
-[pr3]: https://github.com/ringerc/postgres/pull/3 "core: protocol headers ('M' message + _pq_.headers negotiation)"
+[pr3]: https://github.com/ringerc/postgres/pull/3 "core: trace context ('M' TraceContext message + protocol 3.3 negotiation)"
 [pr5]: https://github.com/ringerc/postgres/pull/5 "core: generic key/value annotations on ErrorData"
 
 Patch series, in dependency order:
 
-* **[PR #3][pr3] — protocol headers.**  Adds the `'M'`
-  (RequestHeaders) frontend message, the `_pq_.headers=1` startup
-  negotiation, and the `RegisterProtocolHeaderHandler` extension
-  API.  `contrib/otel` registers an `otel.` prefix handler so
-  clients can attach `traceparent` / `tracestate` to each query
-  out-of-band, without having to put trace context inside the SQL
-  text (sqlcommenter) or burn a round-trip on `SET`.  Depends on
-  [PR #4][pr4] (`pre_ready_for_query_hook`) only for
-  statement-scope semantics, which `contrib/otel` does not
-  currently use.
+* **[PR #3][pr3] — TraceContext message.**  Adds the `'M'`
+  (`TraceContext`) frontend message and bumps the protocol to
+  version 3.3, using the standard min/max version negotiation
+  (`NegotiateProtocolVersion` handles downgrade).  The message
+  carries exactly two fixed W3C fields — `traceparent` and
+  `tracestate` — as NUL-terminated strings; there is no open
+  key/value entry list.  `contrib/otel` registers a single
+  `RegisterTraceContextHandler` consumer so clients can attach
+  trace context to each query out-of-band, without having to put
+  it inside the SQL text (sqlcommenter) or burn a round-trip on
+  `SET`.  Core applies context on receipt and clears it at the
+  next ReadyForQuery via the consumer's `clear_cb`; the demo's
+  `pre_ready_for_query_hook` (PR #4) is no longer needed for
+  trace-context scope.
 * **[PR #5][pr5] — elog annotations.**  Adds a generic
   key/value annotations list on `ErrorData`, the `errannot()` /
   `errannotf()` helpers, structured emission through the JSON and
@@ -84,9 +88,9 @@ Patch series, in dependency order:
 [sqlc]: https://google.github.io/sqlcommenter/
 
 Detection mechanism (informational): `contrib/otel`'s build
-probes the installed server headers for `libpq/protocol_headers.h`
+probes the installed server headers for `libpq/trace_context.h`
 and for an `errannot` prototype in `utils/elog.h`, and defines
-`-DOTEL_HAVE_PROTOCOL_HEADERS` / `-DOTEL_HAVE_ERRANNOT`
+`-DOTEL_HAVE_TRACE_CONTEXT` / `-DOTEL_HAVE_ERRANNOT`
 accordingly.  No configure step or feature flags are required on
 the consumer side; this demo links against the same headers and
 inherits the matching code paths.

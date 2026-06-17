@@ -78,22 +78,25 @@ PostgreSQL source (master + this series). Citations are
       switch with no extension hook.  Unknown letters are silently
       ignored.*
 
-## B. Wire protocol: per-message trace context, zero added round trips
+## B. Wire protocol: single-purpose TraceContext message, zero added round trips
 
-- [ ] **New protocol message byte `'M'` (RequestHeaders), carrying
-      namespaced `(key, value)` entries**
-      (`src/backend/tcop/postgres.c:4868`, the `PostgresMain`
-      message-byte switch; `src/include/libpq/protocol.h`)
+- [ ] **New protocol message byte `'M'` (`TraceContext`), carrying
+      two fixed W3C fields: `traceparent` and `tracestate`**
+      (`src/backend/tcop/postgres.c`, the `PostgresMain`
+      message-byte switch; `src/include/libpq/protocol.h`;
+      `src/backend/libpq/trace_context.c`)
       *The dispatch is a switch on `firstchar` with a `default:` that
-      `ereport(FATAL, ...)`s on unknown bytes (postgres.c:5148). No
-      "register new wire message type" hook exists, and there cannot
-      be one without protocol-version bookkeeping that only core
-      does. This is the change that enables per-message,
-      zero-round-trip context delivery.*
+      `ereport(ERROR, ...)`s on unknown bytes. No "register new wire
+      message type" hook exists, and there cannot be one without
+      protocol-version bookkeeping that only core does. The message
+      carries exactly two NUL-terminated strings — `traceparent` and
+      `tracestate` — not an open key/value entry list. This is the
+      change that enables per-message, zero-round-trip context
+      delivery.*
 
   **Concrete motivation — sqlcommenter vs. client-side
   prepared-statement caches.** The widely-cited alternative to a
-  wire-level header is
+  wire-level message is
   [**sqlcommenter**](https://google.github.io/sqlcommenter/), which
   injects trace context as a SQL-comment prefix
   (`/*traceparent='00-{trace-id}-{span-id}-{flags}'*/ SELECT …`)
@@ -130,9 +133,9 @@ PostgreSQL source (master + this series). Citations are
   via `SET` / `SET LOCAL` — has its own set of failure modes,
   covered in the next subsection.
 
-  Only a per-message, out-of-band header in the wire protocol
-  attaches context without mutating SQL text and without adding a
-  round trip. This is the failure mode that
+  Only a per-message, out-of-band wire message attaches context
+  without mutating SQL text and without adding a round trip.
+  This is the failure mode that
   [sqlcommenter](https://google.github.io/sqlcommenter/) cannot
   escape on any driver that caches prepared statements by SQL
   string — i.e., effectively all modern PostgreSQL drivers that
@@ -162,7 +165,7 @@ PostgreSQL source (master + this series). Citations are
      offer it, some don't, and middleware/wrapper-level
      instrumentation generally cannot introduce pipelining without
      rewriting the application's data-access path. The `'M'`
-     header rides on the same message turn as the operation it
+     message rides on the same message turn as the operation it
      labels; no extra round trip is possible because there is no
      extra message.
 
@@ -176,9 +179,9 @@ PostgreSQL source (master + this series). Citations are
      round trip per (1) above). The same problem applies to
      pipelined or batched workloads that interleave multiple
      distinct traced operations on the same connection inside one
-     transaction. The `'M'` header is per-message, so each Execute
-     can carry its own distinct trace context without disturbing
-     transaction state.
+     transaction. The `'M'` message is per-pipeline-window, so
+     each window can carry its own distinct trace context without
+     disturbing transaction state.
 
   3. **No reliable per-statement clearing.** `SET LOCAL` persists
      to end-of-transaction; `SET` persists to end-of-session.
@@ -194,9 +197,9 @@ PostgreSQL source (master + this series). Citations are
      statement is *untraced*, that statement silently inherits the
      previous trace's context — a correctness failure that
      produces miscorrelated spans in the trace backend. The `'M'`
-     header has per-message lifecycle clearing as a protocol
-     invariant: there is no leftover-state failure mode by
-     construction.
+     message's until-RFQ lifecycle is a protocol invariant: core
+     clears at every ReadyForQuery boundary via `clear_cb`, so
+     there is no leftover-state failure mode by construction.
 
   Taken together, sqlcommenter and `SET`/`SET LOCAL` cover the two
   paths an extension-only solution can take to deliver trace
@@ -204,84 +207,80 @@ PostgreSQL source (master + this series). Citations are
   tracing of any non-trivial workload. The protocol-message
   approach is what closes that gap.
 
-- [ ] **`_pq_.headers=1` startup-option negotiation**
-      (`src/backend/tcop/backend_startup.c:807`, the `_pq_.*` arm of
-      `ProcessStartupPacket`)
-      *Unknown `_pq_.*` options are collected into
-      `unrecognized_protocol_options` and later reported via
-      `NegotiateProtocolVersion` — by design, with no extension hook
-      anywhere in the path. `shared_preload_libraries` extensions
-      load before `ProcessStartupPacket` runs but have no
-      registration point inside it.*
+- [ ] **Protocol version 3.3 negotiation**
+      (`src/backend/tcop/backend_startup.c`,
+      `src/include/libpq/pqcomm.h`)
+      *`PG_PROTOCOL_LATEST` is bumped to `PG_PROTOCOL(3,3)`.
+      Existing min/max negotiation clamps `FrontendProtocol` and
+      fires `NegotiateProtocolVersion` on a higher-minor request,
+      handling downgrade transparently. The per-message gate checks
+      `PG_PROTOCOL_MINOR(FrontendProtocol) >= 3`. The startup-option
+      opt-in branch and the affirmative acknowledgement
+      `ParameterStatus` from the earlier design are removed — the
+      minor version conveys availability without them.*
 
-- [ ] **Affirmative `protocol_features` `ParameterStatus` at startup**
-      (`src/backend/tcop/postgres.c:4407`,
-      `BeginReportingGUCOptions` / `SendProtocolFeaturesParameterStatus`)
-      *An extension `GUC_REPORT` GUC would be advertised at startup —
-      but blindly, with no way to condition the value on the result
-      of `_pq_.*` negotiation, which the extension cannot observe
-      (see previous item). The whole point of the ack is to defend
-      against pgbouncer-class proxies that silently strip the opt-in
-      from `StartupMessage`, which requires the server to actually
-      respond to negotiation, not just to a static GUC default.*
+- [ ] **Apply-on-receipt dispatch: parse `'M'` and invoke
+      `apply_cb(traceparent, tracestate, ctx)` immediately**
+      (`src/backend/libpq/trace_context.c`,
+      `src/backend/tcop/postgres.c` top-level message switch)
+      *Context is applied the moment the message is received (in
+      top-level-command state only). There is no deferred replay at
+      Q/P/B/E entry points — the GUC-backed consumer state persists
+      naturally until the RFQ clear. Protocol violations (`'M'` in
+      wrong state, `'M'` on a <3.3 connection) are `ERROR`, not
+      `FATAL`.*
 
-- [ ] **`pre_ready_for_query_hook` for statement-scope cleanup**
+- [ ] **`pre_ready_for_query_hook` for end-of-cycle cleanup (PR #4)**
       (`src/backend/tcop/postgres.c`, `src/include/tcop/tcopprot.h`)
-      *Fires just before each `ReadyForQuery`.  The wire-protocol
-      command-cycle boundary is the right granularity for header
-      effects that should not leak past one round-trip, and it
-      cannot be expressed by existing per-statement hooks
-      (`post_parse_analyze_hook`, `ExecutorEnd_hook`,
-      `ProcessUtility_hook`) — those fire mid-cycle for a
-      multi-statement simple Query.  Independently useful for any
-      extension that needs end-of-command-cycle teardown.*
+      *Fires just before each `ReadyForQuery`. Independently useful
+      for any extension that needs end-of-command-cycle teardown.
+      For trace context, core now drives the RFQ clear directly via
+      `clear_cb`; `contrib/otel` no longer relies on this hook for
+      trace-context scope.*
 
-- [ ] **Deferred dispatch: parse `'M'` on receipt, fire `set_cb`s
-      at the start of the next Query / Parse / Bind / Execute**
-      (`src/backend/libpq/protocol_headers.c`,
-      `src/backend/tcop/postgres.c` Q/P/B/E case entries)
-      *Binds a handler error to the SQL operation those headers
-      were intended to prefix.  If `set_cb` ran on receipt, a
-      handler `ERROR` would produce a standalone error, top-level
-      recovery would `ReadyForQuery`, and the client's pipelined
-      next operation would still run — with half-applied header
-      state.  Cannot be expressed without dispatching from inside
-      the Q/P/B/E case entries.*
+- [ ] **`RegisterTraceContextHandler(apply_cb, clear_cb, ctx)`
+      extension API — single consumer, no registry**
+      (`src/include/libpq/trace_context.h`,
+      `src/backend/libpq/trace_context.c`)
+      *The single registered consumer's `apply_cb` fires on each
+      `'M'` receipt; `clear_cb` fires from the ReadyForQuery
+      emission path. Only one consumer may register — a second call
+      is an error. No prefix argument, no scope enum, no
+      per-binding-target replay.*
 
-- [ ] **`RegisterProtocolHeaderHandler` extension API
-      (lifecycle-free signature: prefix + set_cb + ctx)**
-      *The registry has to be invoked from the wire dispatch above;
-      once that's in core, the registry must live with it.  The
-      dispatcher is intentionally lifecycle-free — clear callbacks
-      and scope semantics are the extension's responsibility, wired
-      via `RegisterXactCallback`, `on_proc_exit`, and the new
-      `pre_ready_for_query_hook`.*
-
-- [ ] **Server GUCs gating the feature and bounding header sizes**
-      *Extensions can define GUCs, but the feature-switch and
-      byte-size cap must be evaluated where headers come off the
-      wire — in core's dispatch path.*
+- [ ] **`trace_context_enabled` GUC (single kill-switch)**
+      *Extensions can define GUCs, but the feature gate must be
+      evaluated where `'M'` comes off the wire. There are no
+      entry-count or byte-size GUCs — the payload is two fixed-shape
+      strings bounded by `PQ_SMALL_MESSAGE_LIMIT`.*
 
 ## C. libpq: client-side API and protocol participation
 
-- [ ] **`PQattachHeader` / `PQclearHeaders` / `PQheadersAvailable`
-      API** (`src/interfaces/libpq/fe-exec.c` etc.)
+- [ ] **`PQsetTraceContext` / `PQattachTraceContext` /
+      `PQtraceContextAvailable` API**
+      (`src/interfaces/libpq/fe-trace-context.c` etc.)
       *libpq has no plugin/hook/callback model anywhere in
       `src/interfaces/libpq/`. An external library cannot add
       functions to libpq's API, intercept `PQsend*`, or carry
       connection-lifetime state without forking the library.*
+      - `PQsetTraceContext(conn, traceparent, tracestate)` — arms
+        the connection; libpq re-emits one `'M'` at the start of
+        each subsequent pipeline until disarmed (pass `traceparent
+        = NULL` to disarm). Refuses unless negotiated protocol ≥
+        3.3.
+      - `PQattachTraceContext(conn, traceparent, tracestate)` —
+        one-shot: emits one `'M'` before the next message; not
+        re-sent after that pipeline's RFQ.
+      - `PQtraceContextAvailable(conn)` — returns 1 when
+        `PG_PROTOCOL_MINOR(conn->pversion) >= 3` (negotiated at
+        connect time).
 
-- [ ] **libpq always sends `_pq_.headers=1` in StartupMessage**
+- [ ] **libpq requests protocol 3.3 in StartupMessage**
       (`src/interfaces/libpq/fe-connect.c`)
       *StartupMessage construction is hardcoded in libpq's
-      connection-setup path; no injection point.*
-
-- [ ] **`pqGetNegotiateProtocolVersion3` recognizes `_pq_.headers`
-      as an acknowledged param**
-      *Backward-compat fix forced by the previous item: once libpq
-      always advertises `_pq_.headers`, the receive side must accept
-      the corresponding entry from feature-disabled or older
-      servers.*
+      connection-setup path; no injection point. The bespoke
+      `conn->headersAvailable` flag is removed; availability is
+      determined by `conn->pversion` after negotiation.*
 
 ## D. Documentation
 
@@ -294,8 +293,9 @@ PostgreSQL source (master + this series). Citations are
 
 ## Not on this list (could be out of tree)
 
-- `contrib/otel` — `_otel.*` namespace handler, GUCs for trace
-  context, `emit_log_hook` integration, span emission via
+- `contrib/otel` — `RegisterTraceContextHandler` consumer, GUCs
+  for trace context (`otel_api.traceparent` / `.tracestate`),
+  `emit_log_hook` integration, span emission via
   `ExecutorStart`/`ExecutorEnd`/`ProcessUtility_hook`, sampler
   hook, JSON log emitter, versioned rendezvous API.
 - `contrib/otel_exporter` — file emitter.
@@ -304,7 +304,8 @@ PostgreSQL source (master + this series). Citations are
   GUCs; no core change needed.
 - Span emission hooks themselves (`ExecutorStart`, `ExecutorEnd`,
   `ProcessUtility_hook`, `emit_log_hook`) — already in core.
-- Per-transaction and per-session header-scope clearing — `if`
-  headers exist, a contrib could clear them at the right times
-  using `RegisterXactCallback` and `on_proc_exit`. Only per-message
-  scope is genuinely core-only.
+- Per-transaction and per-session trace-context clearing — the
+  consumer uses an internal flag to distinguish `'M'`-installed
+  context from user `SET` context; `clear_cb` resets only the
+  former at RFQ. Longer-lived (`SET` / `SET LOCAL`) semantics are
+  managed by the GUC machinery, not by core `clear_cb`.
