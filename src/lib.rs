@@ -34,7 +34,8 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 use once_cell::sync::OnceCell;
 use opentelemetry::{
     trace::{
-        SamplingDecision, SpanContext, SpanId, SpanKind, Status, TraceFlags, TraceId, TraceState,
+        Link, SamplingDecision, SpanContext, SpanId, SpanKind, Status, TraceFlags, TraceId,
+        TraceState,
     },
     InstrumentationScope, Key, KeyValue,
 };
@@ -639,6 +640,12 @@ fn translate(state: &BackendState, c: &OtelSpan) -> SpanData {
     let mut events = SpanEvents::default();
     events.events = collect_events(c);
 
+    // Span links associate this span with related spans in other traces
+    // (the SDT bridge links a transaction-lifetime span to the per-statement
+    // query traces, and each query back to the transaction).
+    let mut links = SpanLinks::default();
+    links.links = collect_links(c);
+
     SpanData {
         span_context,
         parent_span_id,
@@ -649,10 +656,42 @@ fn translate(state: &BackendState, c: &OtelSpan) -> SpanData {
         attributes,
         dropped_attributes_count: 0,
         events,
-        links: SpanLinks::default(),
+        links,
         status,
         instrumentation_scope: state.instrumentation_scope.clone(),
     }
+}
+
+// ---- Span links -> OTLP SpanLinks --------------------------------
+//
+// OtelSpan carries up to OTEL_INLINE_LINKS link targets inline (each an
+// OtelSpanContext: trace_id / span_id / trace_flags / tracestate).  n_links
+// is the count of valid entries.  We force the SAMPLED bit on each linked
+// context for the same reason as the span itself (contrib/otel already made
+// the record-decision before emitting).
+fn collect_links(c: &OtelSpan) -> Vec<Link> {
+    let n = (c.n_links.max(0) as usize).min(c.links.len());
+    let mut out = Vec::with_capacity(n);
+    for l in &c.links[..n] {
+        let trace_id = parse_trace_id(&l.trace_id);
+        let span_id = parse_span_id(&l.span_id);
+        if trace_id == TraceId::INVALID || span_id == SpanId::INVALID {
+            continue;
+        }
+        let trace_flags = parse_trace_flags(&l.trace_flags) | TraceFlags::SAMPLED;
+        let ts_str = unsafe { c_str_or_empty(l.tracestate) };
+        let trace_state =
+            TraceState::from_key_value(parse_tracestate(&ts_str)).unwrap_or_default();
+        let span_context = SpanContext::new(
+            trace_id,
+            span_id,
+            trace_flags,
+            /* is_remote = */ true,
+            trace_state,
+        );
+        out.push(Link::new(span_context, Vec::new(), 0));
+    }
+    out
 }
 
 unsafe fn c_str_or_empty(p: *const c_char) -> String {
