@@ -405,6 +405,26 @@ fn build_backend_state(kind: ExporterKind) -> Result<BackendState, Box<dyn std::
     // fallback when env vars didn't supply one.  Skip
     // SdkProvidedResourceDetector because its "unknown_service"
     // would otherwise shadow the "postgres" default.
+    //
+    // TODO: fix service.name handling -- exported spans are stuck at
+    // service.name="postgres" regardless of configuration. Two bugs:
+    //   1. OTEL_SERVICE_NAME is IGNORED. EnvResourceDetector only parses
+    //      OTEL_RESOURCE_ATTRIBUTES; OTEL_SERVICE_NAME is normally honoured by
+    //      SdkProvidedResourceDetector, which we deliberately skip here -- so
+    //      setting OTEL_SERVICE_NAME=<x> has no effect and we fall to
+    //      "postgres". Read std::env::var("OTEL_SERVICE_NAME") explicitly (it
+    //      takes precedence over OTEL_RESOURCE_ATTRIBUTES per the OTel spec)
+    //      before applying the "postgres" fallback.
+    //   2. The otel_api.service_name GUC never reaches this code at all -- the
+    //      exporter only sees env vars, not GUCs. Verified on the deployed
+    //      cluster: otel_api.service_name='oteltracingtest' (config file) AND
+    //      OTEL_SERVICE_NAME='oteltracingtest' (env) STILL exported
+    //      service.name='postgres'. The C side must propagate the GUC to the
+    //      Rust exporter (e.g. pass it through the init FFI, or have otel_api
+    //      export OTEL_SERVICE_NAME / a service.name resource attr from the GUC
+    //      before this runs). Same applies to service.instance.id.
+    // See the companion TODO in postgres_otel_api/otel_api/otel_resource.c and
+    // memory oteltracingtest-tracing-pipeline-blocked.
     let env_resource = Resource::from_detectors(
         Duration::from_secs(0),
         vec![
