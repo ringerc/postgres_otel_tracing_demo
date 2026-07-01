@@ -822,13 +822,12 @@ fn push_kv_array(arr: &[OtelKeyValue], n: c_int, out: &mut Vec<KeyValue>) {
 }
 
 fn collect_events(c: &OtelSpan) -> Vec<opentelemetry::trace::Event> {
+    // The producer lowers everything (including any ereport-derived
+    // "exception" event) into the single unified events[] array before
+    // the exporter runs, so we just iterate it generically.
     let mut out = Vec::new();
-    if c.inline_event_used {
-        out.push(translate_event(&c.inline_event));
-    }
-    if !c.overflow_events.is_null() && c.n_overflow_events > 0 {
-        let slice =
-            unsafe { std::slice::from_raw_parts(c.overflow_events, c.n_overflow_events as usize) };
+    if !c.events.is_null() && c.n_events > 0 {
+        let slice = unsafe { std::slice::from_raw_parts(c.events, c.n_events as usize) };
         for e in slice {
             out.push(translate_event(e));
         }
@@ -837,49 +836,17 @@ fn collect_events(c: &OtelSpan) -> Vec<opentelemetry::trace::Event> {
 }
 
 fn translate_event(e: &OtelSpanEvent) -> opentelemetry::trace::Event {
-    let core = &e.core;
-    let msg = unsafe { c_str_or_empty(e.message) };
+    // Generic OTLP event: { name, time, attrs[] }.  The producer has
+    // already lowered any ereport fields (sqlstate/elevel/code.*/detail/
+    // hint/message) into e.attrs, so there is no special-casing here ---
+    // the ereport-derived event simply arrives with name == "exception".
+    let name = unsafe { c_str_or_empty(e.name) };
     let mut attrs: Vec<KeyValue> = Vec::new();
-
-    // SQLSTATE is by-value (5 chars + NUL) in the C struct.
-    let sqlstate_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(core.sqlstate.as_ptr() as *const u8, core.sqlstate.len())
-    };
-    let nul_at = sqlstate_bytes.iter().position(|&b| b == 0).unwrap_or(0);
-    if nul_at > 0 {
-        if let Ok(s) = std::str::from_utf8(&sqlstate_bytes[..nul_at]) {
-            attrs.push(KeyValue::new("postgres.sqlstate", s.to_owned()));
-        }
-    }
-    attrs.push(KeyValue::new("postgres.elevel", core.elevel as i64));
-
-    if !core.filename.is_null() {
-        attrs.push(KeyValue::new("code.filepath", unsafe {
-            c_str_or_empty(core.filename)
-        }));
-    }
-    attrs.push(KeyValue::new("code.lineno", core.lineno as i64));
-    if !core.funcname.is_null() {
-        attrs.push(KeyValue::new("code.function", unsafe {
-            c_str_or_empty(core.funcname)
-        }));
-    }
-
-    if !e.detail.is_null() {
-        attrs.push(KeyValue::new("postgres.detail", unsafe {
-            c_str_or_empty(e.detail)
-        }));
-    }
-    if !e.hint.is_null() {
-        attrs.push(KeyValue::new("postgres.hint", unsafe {
-            c_str_or_empty(e.hint)
-        }));
-    }
 
     if !e.attrs.is_null() && e.n_attrs > 0 {
         let slice = unsafe { std::slice::from_raw_parts(e.attrs, e.n_attrs as usize) };
         push_kv_array(slice, e.n_attrs, &mut attrs);
     }
 
-    opentelemetry::trace::Event::new(msg, pg_ts_to_systemtime(core.time), attrs, 0)
+    opentelemetry::trace::Event::new(name, pg_ts_to_systemtime(e.time), attrs, 0)
 }
