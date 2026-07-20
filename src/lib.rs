@@ -159,6 +159,12 @@ struct BackendState {
 static PREV_EMIT: OnceCell<otel_span_emit_hook_type> = OnceCell::new();
 static PREV_SAMPLER: OnceCell<otel_sampler_hook_type> = OnceCell::new();
 
+/// The OtelTracingApi pointer installed by otel_api at _PG_init time.
+/// Stored as usize because raw pointers are not Send; the underlying memory
+/// (TopMemoryContext allocation in the postgres process) is safe to read
+/// from any backend after fork.
+static API_PTR: OnceCell<usize> = OnceCell::new();
+
 /// Cached exporter-kind decision (env-var look-up done once in
 /// _PG_init; backends just consult the result).
 static EXPORTER_KIND: OnceCell<ExporterKind> = OnceCell::new();
@@ -246,6 +252,9 @@ unsafe fn init_inner() -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
+
+    // Cache the API pointer for use in build_backend_state (post-fork).
+    API_PTR.set(api_ptr as usize).ok();
 
     // 2. Decide on an exporter kind from the env var now (cheap), so
     //    each backend doesn't re-parse it.
@@ -374,10 +383,26 @@ fn build_sampler_from_env() -> Option<Sampler> {
     }
 }
 
+/// Return the current number of C-side resource attributes.
+/// Cheap: just calls get_resource_attributes to get the count, ignores values.
+fn current_resource_attr_count() -> usize {
+    let Some(&ptr_val) = API_PTR.get() else { return 0 };
+    unsafe {
+        let api = &*(ptr_val as *const OtelTracingApi);
+        let Some(get_attrs) = api.get_resource_attributes else { return 0 };
+        let mut n: c_int = 0;
+        get_attrs(&mut n);
+        n.max(0) as usize
+    }
+}
+
 /// Lazily build the backend-local SDK state on first emit in this
-/// process.  Returns None if construction fails; subsequent emits
-/// in the same backend re-attempt (cheap path: just consulting the
-/// thread_local OnceCell).
+/// process.  Returns None if construction fails.
+///
+/// Rebuilds automatically when the C-side resource attr count grows
+/// (e.g. when BDR lazily publishes bdr.node.name / bdr.node.group_name
+/// after its catalog becomes accessible).  The old BackendState is
+/// leaked (at most one rebuild per backend; cheap).
 ///
 /// CRITICAL: this must NEVER run in the postmaster.  Threads inside
 /// BatchSpanProcessor's worker do not survive fork(); a state built
@@ -385,8 +410,17 @@ fn build_sampler_from_env() -> Option<Sampler> {
 /// Calling this from emit_hook (which only runs in backends, since
 /// contrib/otel doesn't emit spans in the postmaster) is safe.
 fn ensure_backend() -> Option<&'static BackendState> {
-    if let Some(s) = BACKEND_CACHE.with(|c| c.get()) {
-        return Some(s);
+    let current_count = current_resource_attr_count();
+
+    // Fast path: cache hit with same (or more recent) attr count.
+    if let Some((s, built_count)) = BACKEND_CACHE.with(|c| c.get()) {
+        if current_count <= built_count {
+            return Some(s);
+        }
+        // Attr count grew: new Resource attrs (e.g. BDR node identity)
+        // were published since last build.  Rebuild so future spans
+        // carry the full Resource.  The old BackendState is leaked;
+        // its worker thread is benign (single-process, exits with us).
     }
 
     let kind = *EXPORTER_KIND.get()?;
@@ -396,35 +430,25 @@ fn ensure_backend() -> Option<&'static BackendState> {
     // process exits when this state is no longer needed, so a leak
     // costs nothing (the whole address space gets reclaimed).
     let leaked: &'static BackendState = Box::leak(Box::new(state));
-    BACKEND_CACHE.with(|c| c.set(Some(leaked)));
+    BACKEND_CACHE.with(|c| c.set(Some((leaked, current_count))));
     Some(leaked)
 }
 
 fn build_backend_state(kind: ExporterKind) -> Result<BackendState, Box<dyn std::error::Error>> {
-    // Build a Resource: env-driven, with a "postgres" service.name
-    // fallback when env vars didn't supply one.  Skip
-    // SdkProvidedResourceDetector because its "unknown_service"
-    // would otherwise shadow the "postgres" default.
+    // Build a Resource: start from env-driven attributes, then overlay
+    // C-side resource attrs published by otel_api (GUC-configured values
+    // like service.name, service.instance.id, and extension-published
+    // attrs like bdr.node.name / bdr.node.group_name set via resource_add).
     //
-    // TODO: fix service.name handling -- exported spans are stuck at
-    // service.name="postgres" regardless of configuration. Two bugs:
-    //   1. OTEL_SERVICE_NAME is IGNORED. EnvResourceDetector only parses
-    //      OTEL_RESOURCE_ATTRIBUTES; OTEL_SERVICE_NAME is normally honoured by
-    //      SdkProvidedResourceDetector, which we deliberately skip here -- so
-    //      setting OTEL_SERVICE_NAME=<x> has no effect and we fall to
-    //      "postgres". Read std::env::var("OTEL_SERVICE_NAME") explicitly (it
-    //      takes precedence over OTEL_RESOURCE_ATTRIBUTES per the OTel spec)
-    //      before applying the "postgres" fallback.
-    //   2. The otel_api.service_name GUC never reaches this code at all -- the
-    //      exporter only sees env vars, not GUCs. Verified on the deployed
-    //      cluster: otel_api.service_name='oteltracingtest' (config file) AND
-    //      OTEL_SERVICE_NAME='oteltracingtest' (env) STILL exported
-    //      service.name='postgres'. The C side must propagate the GUC to the
-    //      Rust exporter (e.g. pass it through the init FFI, or have otel_api
-    //      export OTEL_SERVICE_NAME / a service.name resource attr from the GUC
-    //      before this runs). Same applies to service.instance.id.
-    // See the companion TODO in postgres_otel_api/otel_api/otel_resource.c and
-    // memory oteltracingtest-tracing-pipeline-blocked.
+    // Precedence (highest wins): C-side attrs > OTEL_SERVICE_NAME env >
+    // OTEL_RESOURCE_ATTRIBUTES env > "postgres" fallback.
+    //
+    // Rationale: GUC-set values are operator-configured for this specific
+    // process and carry higher authority than cluster-wide env vars.
+    // bdr.node.* attrs are set by BDR after catalog access is available
+    // (e.g. in ExecutorStart_hook / ProcessUtility_hook / span-begin paths)
+    // and must override any env-level defaults.
+
     let env_resource = Resource::from_detectors(
         Duration::from_secs(0),
         vec![
@@ -432,10 +456,78 @@ fn build_backend_state(kind: ExporterKind) -> Result<BackendState, Box<dyn std::
             Box::new(EnvResourceDetector::new()) as Box<dyn ResourceDetector>,
         ],
     );
-    let resource = if env_resource.get(Key::new("service.name")).is_some() {
-        env_resource
+
+    // Honour OTEL_SERVICE_NAME explicitly (EnvResourceDetector only reads
+    // OTEL_RESOURCE_ATTRIBUTES; OTEL_SERVICE_NAME requires SdkProvidedResourceDetector
+    // which we deliberately skip to avoid the "unknown_service" default).
+    let env_resource = if env_resource.get(Key::new("service.name")).is_none() {
+        if let Ok(svc) = std::env::var("OTEL_SERVICE_NAME") {
+            if !svc.is_empty() {
+                Resource::new([KeyValue::new("service.name", svc)]).merge(&env_resource)
+            } else {
+                env_resource
+            }
+        } else {
+            env_resource
+        }
     } else {
-        Resource::new([KeyValue::new("service.name", "postgres")]).merge(&env_resource)
+        env_resource
+    };
+
+    // Read C-side resource attributes published by otel_api (service.name
+    // from GUC, service.instance.id, host.name, and any late-added attrs
+    // from extensions like bdr.node.name via api->resource_add()).
+    let resource = if let Some(&ptr_val) = API_PTR.get() {
+        let c_kvs: Vec<KeyValue> = unsafe {
+            let api = &*(ptr_val as *const OtelTracingApi);
+            if let Some(get_attrs) = api.get_resource_attributes {
+                let mut n_out: c_int = 0;
+                let attrs_ptr = get_attrs(&mut n_out);
+                if !attrs_ptr.is_null() && n_out > 0 {
+                    std::slice::from_raw_parts(attrs_ptr, n_out as usize)
+                        .iter()
+                        .filter_map(|a| {
+                            if a.key.is_null() {
+                                return None;
+                            }
+                            let key = CStr::from_ptr(a.key).to_string_lossy().into_owned();
+                            let value = if a.value.is_null() {
+                                String::new()
+                            } else {
+                                CStr::from_ptr(a.value).to_string_lossy().into_owned()
+                            };
+                            if key.is_empty() {
+                                None
+                            } else {
+                                Some(KeyValue::new(key, value))
+                            }
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            }
+        };
+        if c_kvs.is_empty() {
+            // No C-side attrs: fall back to env with "postgres" service.name default.
+            if env_resource.get(Key::new("service.name")).is_some() {
+                env_resource
+            } else {
+                Resource::new([KeyValue::new("service.name", "postgres")]).merge(&env_resource)
+            }
+        } else {
+            // Merge: C-side attrs take precedence (self wins in opentelemetry-sdk merge).
+            Resource::new(c_kvs).merge(&env_resource)
+        }
+    } else {
+        // API pointer not stored (should not happen in practice).
+        if env_resource.get(Key::new("service.name")).is_some() {
+            env_resource
+        } else {
+            Resource::new([KeyValue::new("service.name", "postgres")]).merge(&env_resource)
+        }
     };
 
     // One Tokio runtime per backend.  Multi-thread with one worker:
@@ -610,7 +702,7 @@ unsafe extern "C" fn proc_exit_cb(_code: c_int, _arg: usize) {
         // peek_backend (not ensure_backend) --- shutdown time is the
         // wrong moment to lazily build a processor we'd immediately
         // tear down.
-        if let Some(state) = BACKEND_CACHE.with(|c| c.get()) {
+        if let Some((state, _)) = BACKEND_CACHE.with(|c| c.get()) {
             let _ = state.processor.force_flush();
             let _ = state.processor.shutdown();
         }
@@ -618,7 +710,11 @@ unsafe extern "C" fn proc_exit_cb(_code: c_int, _arg: usize) {
 }
 
 thread_local! {
-    static BACKEND_CACHE: std::cell::Cell<Option<&'static BackendState>> = const { std::cell::Cell::new(None) };
+    /// Cached backend state and the C-side resource attr count at build
+    /// time.  We rebuild when the count grows (i.e. when BDR or another
+    /// extension lazily adds Resource attrs after the first span fires).
+    static BACKEND_CACHE: std::cell::Cell<Option<(&'static BackendState, usize)>>
+        = const { std::cell::Cell::new(None) };
 }
 
 // ---- OtelSpan -> SpanData translation ----------------------------
