@@ -518,8 +518,13 @@ fn build_backend_state(kind: ExporterKind) -> Result<BackendState, Box<dyn std::
                 Resource::new([KeyValue::new("service.name", "postgres")]).merge(&env_resource)
             }
         } else {
-            // Merge: C-side attrs take precedence (self wins in opentelemetry-sdk merge).
-            Resource::new(c_kvs).merge(&env_resource)
+            // Merge: C-side attrs take precedence.  In opentelemetry-rust
+            // 0.27's Resource::merge, the *argument* wins over self — the
+            // opposite of the older "self wins" semantics — so we pass
+            // C-side as the argument to make GUC-configured attributes
+            // (service.name, service.instance.id, bdr.node.*) authoritative
+            // over OTEL_SERVICE_NAME / OTEL_RESOURCE_ATTRIBUTES from env.
+            env_resource.merge(&Resource::new(c_kvs))
         }
     } else {
         // API pointer not stored (should not happen in practice).
