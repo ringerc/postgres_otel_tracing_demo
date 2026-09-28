@@ -3,8 +3,9 @@
 //! Two responsibilities:
 //!
 //!  1. Run bindgen against `wrapper.h` to materialize Rust FFI
-//!     declarations for `OtelSpan`, the rendezvous-published
-//!     `OtelTracingApi`, and `find_rendezvous_variable`.
+//!     declarations for `OtelSpan`, the rendezvous-published root
+//!     table `OtelApi` (MAJOR 3) and its `exporter` sub-table
+//!     `OtelExporterApi`, and `find_rendezvous_variable`.
 //!
 //!  2. Tell rustc to allow unresolved symbols in the produced
 //!     cdylib --- postgres-loadable modules link against `postgres.h`
@@ -71,7 +72,7 @@ fn main() {
         // a C compiler in test mode which complicates packaging.
         .layout_tests(false)
         .generate()
-        .expect("bindgen failed to generate FFI for <otel_api/otel.h>");
+        .expect("bindgen failed to generate FFI for <otel_api/otel_exporter.h>");
 
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
     bindings
