@@ -160,65 +160,19 @@ that the rust SDK recognizes are honoured.  The most useful ones:
 | `OTEL_SERVICE_NAME` | Service name (default: `postgres`) |
 | `OTEL_RESOURCE_ATTRIBUTES` | Additional resource k=v pairs |
 
-### `OTEL_TRACES_SAMPLER`
+### Sampling is not configured here
 
-Honoured, with one important scoping note: contrib/otel's sampler
-hook is only consulted when the propagated W3C `sampled` bit is
-**unset** (see "decide_whether_to_record" gate 5 in contrib/otel).
-So:
-
-| Situation | Effect of `OTEL_TRACES_SAMPLER` |
-|-----------|------|
-| Client traceparent has `sampled=1` | Always recorded (W3C compliance, gate 4); sampler env var is ignored. |
-| `otel.trace_all_queries=on` | Always recorded (gate 2); sampler env var is ignored. |
-| Client traceparent has `sampled=0` | The configured sampler decides. |
-| No client traceparent and `trace_all_queries=off` | Span is dropped before the hook is reached (gate 3). |
-
-Supported sampler names (case-insensitive):
-
-* `always_on` / `parentbased_always_on` (the default)
-* `always_off` / `parentbased_always_off`
-* `traceidratio` / `parentbased_traceidratio`  — uses `OTEL_TRACES_SAMPLER_ARG` as the ratio (`0.0`–`1.0`, default `1.0`)
-* `jaeger_remote` / `parentbased_jaeger_remote` — **NOT supported** in this demo; the SDK requires extra plumbing (HTTP client, dedicated runtime) that we don't pull in.  Falls back to the contrib/otel default (drop on unset bit).
-
-The `parentbased_*` prefix is informational here: contrib/otel
-already applies parent-based logic in C, so we strip the prefix
-and use the delegate sampler directly.
-
-If you want the OTel sampler to be able to **override** an
-upstream-sampled (`sampled=1`) bit — e.g. apply local rate limits
-to traces that arrived already sampled — change the
-sampler-hook **invocation policy** (next section).
-
-### `POSTGRES_OTEL_SAMPLER_HOOK_POLICY` (non-standard)
-
-contrib/otel exposes a policy knob that controls WHEN the sampler
-hook gets called.  This is not an OTel-spec concept (W3C and the
-OTel SDK both treat the sampled bit as authoritative), so the env
-var carries a project-prefixed name.
-
-| Value | When the SDK sampler runs | When the W3C bit is respected |
-|-------|---------------------------|-------------------------------|
-| `hook_on_unsampled_bit` (default) | Only when wire `sampled=0` | `sampled=1` always records |
-| `hook_always` | Every span, regardless of wire bit | Sampler can override `sampled=1` |
-| `never_respect_bit` | Never (hook ignored) | `sampled=1` → record, `sampled=0` → drop |
-| `never_always_sample` | Never (hook ignored) | Wire bit ignored; record everything |
-
-Use cases:
-
-* `hook_on_unsampled_bit` — strict W3C compliance.  The default.
-* `hook_always` — you want local rate limits or tail-based sampling
-  to be able to drop traces that arrived already sampled.
-  Trade-off: violates the W3C "sampled=1 means downstream should
-  see this span" guarantee.
-* `never_respect_bit` — you trust the upstream's wire signal
-  exclusively; the sampler env vars become no-ops.  Lowest hot-
-  path cost.
-* `never_always_sample` — debug mode: record every span that
-  reached gate 4 (has propagated context).  Sampler is ignored.
-
-Set env vars in whatever launches postgres (systemd unit, docker compose,
-shell wrapper) so the postmaster inherits them.
+otel_api owns the sampling decision entirely (`otel_api.sampler` /
+`otel_api.sampler_arg`, standard `OTEL_TRACES_SAMPLER`-style values:
+`always_on`, `always_off`, `traceidratio`, `parentbased_always_on`,
+`parentbased_always_off`, `parentbased_traceidratio`; plus
+`otel.trace_all_queries` to opt a session into tracing new roots at
+all).  There is no sampler hook for an exporter to implement:
+`OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG` are **not** read by
+this module, and by the time a span reaches our emit hook it has
+already been sampled in.  Set `otel_api.sampler` /
+`otel_api.sampler_arg` as GUCs instead (`SET`, `postgresql.conf`, or
+`ALTER SYSTEM`); both are `PGC_SUSET`.
 
 ## Architecture notes
 
@@ -340,13 +294,13 @@ truth because the SDK's own sampler is what sets the bit.  Sampler
 decides RECORD_AND_SAMPLE → SDK writes the bit → exporter sees the
 bit and exports.  No drift possible.
 
-We bypassed the SDK's sampler.  contrib/otel made the recording
-decision in C and handed us a finished span.  The W3C bit on that
-span reflects whatever the upstream client put on the wire, which
-can be `00` even for spans contrib/otel definitely decided to
-record --- e.g. `otel.trace_all_queries=on` overrode an unsampled
-parent, or the sampler hook returned RECORD_AND_SAMPLE without the
-wire bit being set.
+We bypassed the SDK's sampler.  otel_api made the recording
+decision in C (its own `otel_api.sampler` / `otel_api.sampler_arg`
+policy) and handed us a finished span.  The W3C bit on that span
+reflects whatever the upstream client put on the wire, which can be
+`00` even for spans otel_api definitely decided to record --- e.g.
+`otel.trace_all_queries=on` or `otel_api.sampler=always_on` overrode
+an unsampled remote parent.
 
 If we passed that bit through unchanged, `BatchSpanProcessor::
 on_end` would drop spans contrib/otel intentionally recorded.  The
@@ -430,8 +384,9 @@ final `OTEL_BSP_SCHEDULE_DELAY` window vanishes.
 
 * OTLP HTTP protocol (the `grpc-tonic` feature is the only one enabled;
   adding `http-proto` is a Cargo.toml flip).
-* `jaeger_remote` sampler (needs HTTP client + dedicated runtime).
-* Configuration via postgres GUCs.  Env vars only.
+* Configuration via postgres GUCs.  Env vars only (sampling is the
+  exception: `otel_api.sampler` / `otel_api.sampler_arg` are otel_api's
+  own GUCs, not this module's).
 
 ## License
 

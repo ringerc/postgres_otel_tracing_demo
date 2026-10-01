@@ -4,10 +4,9 @@
 //! (`OtelExporterApi`, MAJOR 1, reached through the `OtelApi` root
 //! table rendezvous variable `OtelApi.v3`, MAJOR 3).  Loads as a
 //! postgres shared-preloaded module, locates otel_api's root table,
-//! registers an emit callback (and, if built, a sampler callback)
-//! through the pending-registration protocol so load order with
-//! otel_api doesn't matter, and ships completed spans through the
-//! real `opentelemetry-rust` SDK.
+//! registers an emit callback through the pending-registration
+//! protocol so load order with otel_api doesn't matter, and ships
+//! completed spans through the real `opentelemetry-rust` SDK.
 //!
 //! Exporter selection follows the OpenTelemetry environment-variable
 //! conventions:
@@ -23,11 +22,13 @@
 //!    `OTEL_RESOURCE_ATTRIBUTES`   — Resource attrs (via the SDK's
 //!                                   EnvResourceDetector).
 //!
-//! Note: otel_api itself owns sampling decisions (via its own sampler
-//! hook and `otel.trace_all_queries` GUC).  By the time a span reaches
-//! us via the emit hook, it has already been sampled in.
-//! `OTEL_TRACES_SAMPLER` is therefore NOT honoured here; this exporter
-//! is downstream of the sampler decision.
+//! Note: otel_api owns the sampling decision entirely (`otel_api.sampler`
+//! / `otel_api.sampler_arg`, plus `otel.trace_all_queries` to opt a
+//! session into tracing new roots at all).  There is no sampler hook
+//! for an exporter to implement; by the time a span reaches us via the
+//! emit hook, it has already been sampled in.  `OTEL_TRACES_SAMPLER` /
+//! `OTEL_TRACES_SAMPLER_ARG` are therefore NOT honoured here --- set
+//! `otel_api.sampler` / `otel_api.sampler_arg` instead.
 
 #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals, dead_code)]
 
@@ -37,7 +38,7 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 use once_cell::sync::OnceCell;
 use opentelemetry::{
     trace::{
-        Link, SamplingDecision, SpanContext, SpanId, SpanKind, Status, TraceFlags, TraceId,
+        Link, SpanContext, SpanId, SpanKind, Status, TraceFlags, TraceId,
         TraceState,
     },
     InstrumentationScope, Key, KeyValue, Value,
@@ -46,7 +47,7 @@ use opentelemetry_sdk::{
     export::trace::SpanData,
     resource::{EnvResourceDetector, ResourceDetector, TelemetryResourceDetector},
     runtime::Tokio,
-    trace::{BatchSpanProcessor, Sampler, ShouldSample, SpanEvents, SpanLinks, SpanProcessor},
+    trace::{BatchSpanProcessor, SpanEvents, SpanLinks, SpanProcessor},
     Resource,
 };
 use std::borrow::Cow;
@@ -255,7 +256,6 @@ impl<T> HookCell<T> {
 }
 
 static PREV_EMIT: HookCell<otel_span_emit_hook_type> = HookCell::new(None);
-static PREV_SAMPLER: HookCell<otel_sampler_hook_type> = HookCell::new(None);
 
 /// Pending-registration node for the two-phase deferred registration
 /// path (this module loading before otel_api).  Written once from
@@ -265,27 +265,12 @@ static PREV_SAMPLER: HookCell<otel_sampler_hook_type> = HookCell::new(None);
 static PENDING_REG: HookCell<OtelPendingRegistration> = HookCell::new(OtelPendingRegistration {
     emit_hook: None,
     emit_prev_out: std::ptr::null_mut(),
-    sampler_hook: None,
-    sampler_prev_out: std::ptr::null_mut(),
     next: std::ptr::null_mut(),
 });
 
 /// Cached exporter-kind decision (env-var look-up done once in
 /// _PG_init; backends just consult the result).
 static EXPORTER_KIND: OnceCell<ExporterKind> = OnceCell::new();
-
-/// Sampler built from OTEL_TRACES_SAMPLER + OTEL_TRACES_SAMPLER_ARG
-/// at _PG_init time.  Consulted by sampler_hook (which itself is
-/// only called by otel_api on the propagated-bit-unset path, per the
-/// default OTEL_SAMPLER_HOOK_ON_UNSAMPLED_BIT policy).  The Sampler
-/// is `Send + Sync + Clone` for every variant we accept (AlwaysOn,
-/// AlwaysOff, TraceIdRatioBased --- the Jaeger remote variant is
-/// gated off by feature flag).
-///
-/// None means "no sampler configured" → fall back to otel_api's own
-/// default (record a new trace, the OTel-SDK ParentBased(AlwaysOn)
-/// behaviour).
-static SAMPLER: OnceCell<Sampler> = OnceCell::new();
 
 #[derive(Copy, Clone)]
 enum ExporterKind {
@@ -332,57 +317,21 @@ unsafe fn init_inner() -> Result<(), Box<dyn std::error::Error>> {
     //    is the demo's slot.
     MarkGUCPrefixReserved(b"oteltracingdemo\0".as_ptr() as *const c_char);
 
-    // 3. Build the Sampler from OTEL_TRACES_SAMPLER + OTEL_TRACES_SAMPLER_ARG,
-    //    ahead of registration, so both the immediate and pending paths
-    //    below can decide whether to also register a sampler hook.
-    let have_sampler = if let Some(sampler) = build_sampler_from_env() {
-        SAMPLER.set(sampler).ok();
-        true
-    } else {
-        false
-    };
-
-    // 4. Register (order-independent protocol): if otel_api's root +
+    // 3. Register (order-independent protocol): if otel_api's root +
     //    exporter tables are already published and compatible,
     //    register directly.  Otherwise queue a pending registration
     //    on "OtelApi.v3.pending" for otel_api to drain from its own
     //    _PG_init, reimplementing otel_exporter_register_when_ready()
     //    (a `static inline` in otel_exporter.h, not callable from
     //    Rust) by hand.
+    //
+    //    Sampling is entirely otel_api's own policy (otel_api.sampler /
+    //    otel_api.sampler_arg); there is no sampler hook to register.
     if let Some(exporter) = get_exporter_api() {
         let register_emit = exporter
             .register_emit_hook
             .ok_or("OtelExporterApi.register_emit_hook is null")?;
         register_emit(Some(emit_hook), PREV_EMIT.get_ptr());
-
-        if have_sampler {
-            let register_sampler = exporter
-                .register_sampler_hook
-                .ok_or("OtelExporterApi.register_sampler_hook is null")?;
-            register_sampler(Some(sampler_hook), PREV_SAMPLER.get_ptr());
-        }
-
-        // 5. Optionally override otel_api's sampler-hook invocation
-        //    policy.  Recognized values for POSTGRES_OTEL_SAMPLER_HOOK_POLICY
-        //    (the env-var name is non-standard --- the policy is an
-        //    otel_api concept that doesn't map to anything in the
-        //    OpenTelemetry spec, so we use a deliberately
-        //    project-prefixed name):
-        //
-        //      hook_on_unsampled_bit  - default (W3C-compliant)
-        //      hook_always            - SDK sees every span, even bit=1
-        //      never_respect_bit      - pure wire-bit, hook never called
-        //      never_always_sample    - record everything (hook ignored)
-        //
-        //    Only possible on this immediate path: the pending
-        //    registration protocol has no slot for a policy override,
-        //    so if this module loads before otel_api, the policy stays
-        //    at otel_api's default and we say so.
-        if let Some(policy) = parse_sampler_policy_env() {
-            if let Some(set_policy) = exporter.set_sampler_policy {
-                set_policy(policy);
-            }
-        }
     } else {
         let pending_name = CStr::from_bytes_with_nul(OTEL_EXPORTER_PENDING_NAME)?;
         let pslot = find_rendezvous_variable(pending_name.as_ptr());
@@ -393,80 +342,11 @@ unsafe fn init_inner() -> Result<(), Box<dyn std::error::Error>> {
         let reg = &mut *PENDING_REG.get_ptr();
         reg.emit_hook = Some(emit_hook);
         reg.emit_prev_out = PREV_EMIT.get_ptr();
-        if have_sampler {
-            reg.sampler_hook = Some(sampler_hook);
-            reg.sampler_prev_out = PREV_SAMPLER.get_ptr();
-        }
         reg.next = *pslot as *mut OtelPendingRegistration;
         *pslot = PENDING_REG.get_ptr() as *mut c_void;
-
-        if parse_sampler_policy_env().is_some() {
-            eprintln!(
-                "postgres_otel_tracing_demo: otel_api not yet loaded; \
-                 POSTGRES_OTEL_SAMPLER_HOOK_POLICY cannot be applied via the \
-                 pending-registration path and will be ignored (load otel_api \
-                 before this module in shared_preload_libraries to use it)"
-            );
-        }
     }
 
     Ok(())
-}
-
-fn parse_sampler_policy_env() -> Option<OtelSamplerHookPolicy> {
-    let raw = std::env::var("POSTGRES_OTEL_SAMPLER_HOOK_POLICY").ok()?;
-    match raw.to_lowercase().as_str() {
-        "hook_on_unsampled_bit" => Some(OtelSamplerHookPolicy_OTEL_SAMPLER_HOOK_ON_UNSAMPLED_BIT),
-        "hook_always" => Some(OtelSamplerHookPolicy_OTEL_SAMPLER_HOOK_ALWAYS),
-        "never_respect_bit" => Some(OtelSamplerHookPolicy_OTEL_SAMPLER_HOOK_NEVER_RESPECT_BIT),
-        "never_always_sample" => Some(OtelSamplerHookPolicy_OTEL_SAMPLER_HOOK_NEVER_ALWAYS_SAMPLE),
-        other => {
-            eprintln!(
-                "postgres_otel_tracing_demo: POSTGRES_OTEL_SAMPLER_HOOK_POLICY={other} unrecognized; \
-                 valid: hook_on_unsampled_bit, hook_always, never_respect_bit, never_always_sample"
-            );
-            None
-        }
-    }
-}
-
-/// Build an SDK Sampler from the OTEL_TRACES_SAMPLER env var, honouring
-/// OTEL_TRACES_SAMPLER_ARG for the ratio variants.  Returns None for
-/// unrecognized sampler names (caller treats this as "no sampler
-/// registered").
-///
-/// Scope: otel_api calls our sampler hook ONLY when the propagated
-/// W3C sampled bit is unset (the default OTEL_SAMPLER_HOOK_ON_UNSAMPLED_BIT
-/// policy).  Upstream sampled=1 always wins for W3C compliance, and
-/// otel.trace_all_queries=on overrides at an earlier gate.  The
-/// `parentbased_*` prefix is therefore informational here: otel_api
-/// already handles parent-based logic in C, so we strip the prefix
-/// and just use the delegate sampler.
-fn build_sampler_from_env() -> Option<Sampler> {
-    let name = std::env::var("OTEL_TRACES_SAMPLER")
-        .unwrap_or_else(|_| "parentbased_always_on".into())
-        .to_lowercase();
-    let arg = std::env::var("OTEL_TRACES_SAMPLER_ARG").ok();
-
-    match name.as_str() {
-        "always_on" | "parentbased_always_on" => Some(Sampler::AlwaysOn),
-        "always_off" | "parentbased_always_off" => Some(Sampler::AlwaysOff),
-        "traceidratio" | "parentbased_traceidratio" => {
-            let ratio: f64 = arg
-                .and_then(|s| s.parse::<f64>().ok())
-                .map(|r| r.clamp(0.0, 1.0))
-                .unwrap_or(1.0);
-            Some(Sampler::TraceIdRatioBased(ratio))
-        }
-        "jaeger_remote" | "parentbased_jaeger_remote" => {
-            eprintln!("postgres_otel_tracing_demo: OTEL_TRACES_SAMPLER={name} not supported in this demo");
-            None
-        }
-        other => {
-            eprintln!("postgres_otel_tracing_demo: OTEL_TRACES_SAMPLER={other} unrecognized; falling back to otel_api default");
-            None
-        }
-    }
 }
 
 /// Return the current number of C-side resource attributes.
@@ -672,71 +552,6 @@ fn build_backend_state(kind: ExporterKind) -> Result<BackendState, Box<dyn std::
 }
 
 // ---- Span emit hook ----------------------------------------------
-
-/// Sampler hook --- otel_api calls this when the propagated W3C
-/// sampled bit is UNSET (under the default OTEL_SAMPLER_HOOK_ON_UNSAMPLED_BIT
-/// policy).  We delegate to the OTel SDK Sampler we built from env vars.
-///
-/// Lives entirely in postmaster-static state (`SAMPLER`); no fork-
-/// sensitive resources to lazy-init, no threads.  This means the
-/// hook is cheap (no allocation in the steady state) which matches
-/// otel_api's "MUST be fast (~nanoseconds), MUST NOT allocate if
-/// avoidable" contract.
-unsafe extern "C" fn sampler_hook(input: *const OtelSamplerInput) -> OtelSamplerDecision {
-    let result = catch_unwind(|| -> OtelSamplerDecision {
-        if input.is_null() {
-            return OtelSamplerDecision_OTEL_SAMPLE_DROP;
-        }
-        let input = &*input;
-
-        let sampler = match SAMPLER.get() {
-            Some(s) => s,
-            None => return OtelSamplerDecision_OTEL_SAMPLE_DROP,
-        };
-
-        // OtelSamplerInput.trace_id is a binary *const OtelTraceId
-        // (16-byte array), owned by otel_api, valid only during the
-        // call.
-        let trace_id = if input.trace_id.is_null() {
-            TraceId::INVALID
-        } else {
-            TraceId::from_bytes((*input.trace_id).b)
-        };
-
-        let name = c_str_or_empty(input.name);
-        let kind = map_kind(input.kind);
-
-        // Call the SDK's should_sample.  We pass parent_context=None
-        // because otel_api has already applied parent-based logic
-        // before invoking this hook (a remote parent with sampled=1
-        // never reaches us at all under the default policy).  The
-        // `parentbased_*` prefix in OTEL_TRACES_SAMPLER is therefore
-        // informational; we strip it in build_sampler_from_env and
-        // use the delegate directly.
-        let result = sampler.should_sample(
-            None, /* parent_context */
-            trace_id,
-            &name,
-            &kind,
-            &[],  /* attributes */
-            &[],  /* links */
-        );
-
-        match result.decision {
-            SamplingDecision::Drop => OtelSamplerDecision_OTEL_SAMPLE_DROP,
-            SamplingDecision::RecordOnly => OtelSamplerDecision_OTEL_SAMPLE_RECORD_ONLY,
-            SamplingDecision::RecordAndSample => OtelSamplerDecision_OTEL_SAMPLE_RECORD_AND_SAMPLE,
-        }
-    });
-
-    // We deliberately do NOT chain to PREV_SAMPLER.  Unlike the emit
-    // hook (where every consumer wants to see every span), the
-    // sampler hook produces a single decision; "stacked samplers"
-    // have no obvious composition rule.  The contract is: the
-    // last-registered sampler wins; previously-registered hooks are
-    // shadowed.  Document this in the README.
-    result.unwrap_or(OtelSamplerDecision_OTEL_SAMPLE_DROP)
-}
 
 unsafe extern "C" fn emit_hook(span_ptr: *const OtelSpan) {
     let _ = catch_unwind(|| {
